@@ -191,6 +191,12 @@ recorded in header feature bit 0 (section 2). It rejects a chunk whose extent wo
 the u32 span fields rather than letting one wrap. Under order b the writer holds one axis-a
 member's runs in memory at a time, which is the same bound `.tui`'s own builder has.
 
+**Known limit: the writer holds the whole compressed `runs` section in memory until close.**
+That is fine at the scale tested so far — a few GB for the fish subtree — but not for a
+577-way-sized index (~100 GB). Streaming chunks to disk as they are emitted is a writer
+change only: the format already puts the directories after the payload, so nothing on disk
+needs to move.
+
 ---
 
 ## 2. Container
