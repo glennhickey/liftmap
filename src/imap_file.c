@@ -107,6 +107,9 @@ struct imap_writer {
     uint64_t  pend_bmin, pend_bmax;
 
     imap_chunk *chunks; uint32_t n_chunks, cap_chunks;
+
+    /* order b: one whole axis-a member buffered, with each run's axis-b member */
+    struct brun { imap_run r; uint32_t bm; } *bbuf;  uint32_t n_bbuf, cap_bbuf, bbuf_amem;
     vec runs;                                        /* the runs section body */
     int failed;
 };
@@ -154,19 +157,11 @@ int32_t imap_writer_add_member(imap_writer *w, int axis, const char *name, uint6
 }
 
 /* Encode and append the pending chunk. */
-static int cmp_run_b(const void *x, const void *y) {
-    const imap_run *p = (const imap_run *)x, *q = (const imap_run *)y;
-    if (p->b != q->b) return p->b < q->b ? -1 : 1;
-    return (p->a > q->a) - (p->a < q->a);
-}
-
-static int flush_chunk(imap_writer *w) {
-    if (w->n_pend == 0) return 0;
-    /* The chunk was cut in axis-a order; under order b it is stored sorted by (b, a).
-     * Axis a is a partial function, so (b, a) is a total order with no ties. */
-    if (w->order == IMAP_ORDER_B) qsort(w->pend, w->n_pend, sizeof *w->pend, cmp_run_b);
+/* Encode n runs, already in stored order, as one chunk of members (am, bm). */
+static int emit_chunk(imap_writer *w, const imap_run *runs, uint32_t n, uint32_t am, uint32_t bm) {
+    if (n == 0) return 0;
     imap_buf st[IMAP_N_STREAMS];
-    if (imap_encode_chunk(w->pend, w->n_pend, w->order, st) != 0) return -1;
+    if (imap_encode_chunk(runs, n, w->order, st) != 0) return -1;
 
     /* Chunk blob (SPEC 2.2): u32 raw_len[4], u32 stored_len[4], then the four stored
      * streams.  A stream is deflated only where that makes it smaller; otherwise it is
@@ -201,33 +196,35 @@ static int flush_chunk(imap_writer *w) {
         if (!c) { vec_free(&blob); return -1; }
         w->chunks = c; w->cap_chunks = cap;
     }
-    /* extents from min/max rather than first/last: under order b the runs are no
-     * longer in axis-a order by the time we get here */
-    int64_t amin = w->pend[0].a, amax = w->pend[0].a + w->pend[0].len;
-    for (uint32_t k = 1; k < w->n_pend; k++) {
-        if (w->pend[k].a < amin) amin = w->pend[k].a;
-        if (w->pend[k].a + w->pend[k].len > amax) amax = w->pend[k].a + w->pend[k].len;
+    /* extents from min/max: the stored order is only sorted on its own axis */
+    int64_t amin = runs[0].a, amax = runs[0].a + runs[0].len;
+    int64_t bmin = runs[0].b, bmax = runs[0].b + runs[0].len;
+    for (uint32_t k = 1; k < n; k++) {
+        if (runs[k].a < amin) amin = runs[k].a;
+        if (runs[k].a + runs[k].len > amax) amax = runs[k].a + runs[k].len;
+        if (runs[k].b < bmin) bmin = runs[k].b;
+        if (runs[k].b + runs[k].len > bmax) bmax = runs[k].b + runs[k].len;
     }
     uint64_t a_span64 = (uint64_t)(amax - amin);
-    uint64_t b_span64 = w->pend_bmax - w->pend_bmin;
+    uint64_t b_span64 = (uint64_t)(bmax - bmin);
     if (a_span64 > 0xFFFFFFFFull || b_span64 > 0xFFFFFFFFull) { vec_free(&blob); return -1; }
 
     imap_chunk *c = &w->chunks[w->n_chunks];
     memset(c, 0, sizeof *c);
-    c->a_member = w->pend_amem; c->b_member = w->pend_bmem;
+    c->a_member = am; c->b_member = bm;
     c->a_min = (uint64_t)amin;
     c->a_span = (uint32_t)a_span64;
-    c->b_min = w->pend_bmin;
+    c->b_min = (uint64_t)bmin;
     c->b_span = (uint32_t)b_span64;
     /* the first run in stored order is the min on the ordering axis, so only the other
      * axis's base needs storing */
     c->base = w->order == IMAP_ORDER_A
-            ? (uint64_t)imap_b_enter(w->pend[0].b, w->pend[0].len, w->pend[0].strand)
-            : (uint64_t)w->pend[0].a;
+            ? (uint64_t)imap_b_enter(runs[0].b, runs[0].len, runs[0].strand)
+            : (uint64_t)runs[0].a;
     c->off = w->runs.n;
     c->clen = (uint32_t)bodylen;
     c->rawlen = rawlen32;
-    c->n_runs = w->n_pend;
+    c->n_runs = n;
     c->codec = (uint32_t)w->codec;
 
     int rc = vec_put(&w->runs, body, bodylen);
@@ -235,8 +232,58 @@ static int flush_chunk(imap_writer *w) {
     if (rc != 0) return -1;
 
     w->n_chunks++;
+    return 0;
+}
+
+
+/* Order a: the pending list, cut in axis-a order as runs arrived, is one chunk. */
+static int flush_chunk(imap_writer *w) {
+    if (w->n_pend == 0) return 0;
+    if (emit_chunk(w, w->pend, w->n_pend, w->pend_amem, w->pend_bmem) != 0) return -1;
     w->n_pend = 0;
     return 0;
+}
+
+static int cmp_brun(const void *x, const void *y) {
+    const struct brun *p = (const struct brun *)x, *q = (const struct brun *)y;
+    if (p->bm != q->bm) return p->bm < q->bm ? -1 : 1;
+    if (p->r.b != q->r.b) return p->r.b < q->r.b ? -1 : 1;
+    return (p->r.a > q->r.a) - (p->r.a < q->r.a);       /* a unique within a member */
+}
+
+/* Order b (SPEC 1.3): a whole axis-a member is buffered, sorted by (b_member, b, a), and
+ * cut into chunks ALONG AXIS B -- tui's layout.  Cutting in axis-a order and sorting only
+ * inside each chunk is not equivalent: on a universal column axis the span cap then fires
+ * at nearly every rearrangement, and a real .tui came out 22x larger that way. */
+static int flush_member_b(imap_writer *w) {
+    uint32_t n = w->n_bbuf;
+    if (n == 0) return 0;
+    qsort(w->bbuf, n, sizeof *w->bbuf, cmp_brun);
+    imap_run *tmp = malloc((size_t)(n < w->count ? n : w->count) * sizeof *tmp);
+    if (!tmp) return -1;
+    uint32_t i = 0;
+    int rc = 0;
+    while (i < n && rc == 0) {
+        uint32_t bm = w->bbuf[i].bm;
+        int64_t blo = w->bbuf[i].r.b, bhi = blo + w->bbuf[i].r.len;
+        int64_t alo = w->bbuf[i].r.a, ahi = alo + w->bbuf[i].r.len;
+        uint32_t j = i + 1;
+        while (j < n && j - i < w->count && w->bbuf[j].bm == bm) {
+            const imap_run *r = &w->bbuf[j].r;
+            int64_t nbhi = r->b + r->len > bhi ? r->b + r->len : bhi;     /* sorted: blo fixed */
+            int64_t nalo = r->a < alo ? r->a : alo;
+            int64_t nahi = r->a + r->len > ahi ? r->a + r->len : ahi;
+            if (w->bspan && (uint64_t)(nbhi - blo) > w->bspan) break;
+            if ((uint64_t)(nbhi - blo) > 0xFFFFFFFFull || (uint64_t)(nahi - nalo) > 0xFFFFFFFFull) break;
+            bhi = nbhi; alo = nalo; ahi = nahi; j++;
+        }
+        for (uint32_t k = i; k < j; k++) tmp[k - i] = w->bbuf[k].r;
+        rc = emit_chunk(w, tmp, j - i, w->bbuf_amem, bm);
+        i = j;
+    }
+    free(tmp);
+    w->n_bbuf = 0;
+    return rc;
 }
 
 int imap_writer_add_run(imap_writer *w, uint32_t a_member, uint32_t b_member,
@@ -251,6 +298,24 @@ int imap_writer_add_run(imap_writer *w, uint32_t a_member, uint32_t b_member,
      * otherwise two chunks of the same member can claim the same bases. */
     wmember *am = &w->mem[0][a_member];
     if (am->has_runs && a < am->last_a_exit) { w->failed = 1; return -1; }
+
+    if (w->order == IMAP_ORDER_B) {
+        if (w->n_bbuf && a_member != w->bbuf_amem) {
+            if (flush_member_b(w) != 0) { w->failed = 1; return -1; }
+        }
+        if (w->n_bbuf == w->cap_bbuf) {
+            uint32_t cap = w->cap_bbuf ? w->cap_bbuf * 2 : 4096;
+            struct brun *nb = realloc(w->bbuf, (size_t)cap * sizeof *nb);
+            if (!nb) { w->failed = 1; return -1; }
+            w->bbuf = nb; w->cap_bbuf = cap;
+        }
+        struct brun *br = &w->bbuf[w->n_bbuf++];
+        br->r.a = a; br->r.b = b; br->r.len = len; br->r.strand = strand ? 1 : 0;
+        br->bm = b_member;
+        w->bbuf_amem = a_member;
+        am->last_a_exit = a + len; am->has_runs = 1;
+        return 0;
+    }
 
     uint64_t nlo = (uint64_t)b, nhi = (uint64_t)(b + len);
     if (w->n_pend) {
@@ -362,9 +427,9 @@ static int write_all(FILE *fp, const void *p, size_t n) {
 int imap_writer_close(imap_writer *w) {
     if (!w) return -1;
     int rc = -1;
-    vec foot = {0}, dira = {0}, dirb = {0}, ma = {0}, mb = {0};
+    vec foot = {0}, dira = {0}, dirax = {0}, dirb = {0}, ma = {0}, mb = {0};
     if (w->failed) goto done;
-    if (flush_chunk(w) != 0) goto done;
+    if ((w->order == IMAP_ORDER_B ? flush_member_b(w) : flush_chunk(w)) != 0) goto done;
 
     /* dir.a is sorted by (a_member, a_min).  Chunks are addressed by payload offset,
      * so reordering the directory moves nothing on disk.  Per-member order across
@@ -375,9 +440,15 @@ int imap_writer_close(imap_writer *w) {
         for (uint32_t i = 0; i < w->n_mem[ax]; i++) {
             w->mem[ax][i].seen = 0; w->mem[ax][i].first_chunk = 0; w->mem[ax][i].n_chunks = 0;
         }
+    uint64_t a_run_max = 0;
     for (uint32_t i = 0; i < w->n_chunks; i++) {
         imap_chunk *c = &w->chunks[i];
         note_range(&w->mem[0][c->a_member], i, c->a_min, c->a_min + c->a_span);
+        /* dir.a.max: running max of a_end, reset per member -- the axis-a twin of
+         * dir.b's.  Under order b a member's chunks overlap on axis a. */
+        uint64_t a_end = c->a_min + c->a_span;
+        if (i == 0 || c->a_member != w->chunks[i-1].a_member || a_end > a_run_max) a_run_max = a_end;
+        if (vec_put64(&dirax, a_run_max) != 0) goto done;
         if (vec_put32(&dira, c->a_member) || vec_put32(&dira, c->b_member) ||
             vec_put64(&dira, c->a_min) || vec_put32(&dira, c->a_span) ||
             vec_put32(&dira, c->b_span) || vec_put64(&dira, c->b_min) ||
@@ -437,6 +508,7 @@ int imap_writer_close(imap_writer *w) {
         { "mem.b",  mb.p,       mb.n,       IMAP_CODEC_NONE, mb.n       },
         { "runs",   w->runs.p,  w->runs.n,  IMAP_CODEC_NONE, w->runs.n  },
         { "dir.a",  dira.p,     dira.n,     IMAP_CODEC_NONE, dira.n     },
+        { "dir.a.max", dirax.p, dirax.n,    IMAP_CODEC_NONE, dirax.n    },
         { "dir.b",  dirb.p,     dirb.n,     IMAP_CODEC_NONE, dirb.n     },
     };
     const int NSEC = (int)(sizeof sec / sizeof sec[0]);
@@ -485,7 +557,7 @@ int imap_writer_close(imap_writer *w) {
     if (fflush(w->fp) != 0) goto done;
     rc = 0;
 done:
-    vec_free(&foot); vec_free(&dira); vec_free(&dirb); vec_free(&ma); vec_free(&mb);
+    vec_free(&foot); vec_free(&dira); vec_free(&dirax); vec_free(&dirb); vec_free(&ma); vec_free(&mb);
     if (w->fp) { if (fclose(w->fp) != 0) rc = -1; w->fp = NULL; }
     if (rc != 0 && w->path) remove(w->path);   /* no half-written file left behind */
     imap_writer_abort(w);
@@ -499,7 +571,7 @@ void imap_writer_abort(imap_writer *w) {
         for (uint32_t i = 0; i < w->n_mem[ax]; i++) free(w->mem[ax][i].name);
         free(w->mem[ax]);
     }
-    free(w->pend); free(w->chunks);
+    free(w->pend); free(w->chunks); free(w->bbuf);
     vec_free(&w->runs);
     free(w->path); free(w->profile); free(w->schema);
     free(w);
@@ -514,6 +586,7 @@ struct imap_file {
     int order;
     imap_chunk *chunks; uint32_t n_chunks;
     uint32_t *dirb_id; uint64_t *dirb_max;
+    uint64_t *dira_max;
     imap_member *mem[2]; uint32_t n_mem[2];
     uint32_t *by_name[2];
     uint64_t runs_off, runs_len;
@@ -596,8 +669,8 @@ imap_file *imap_open_io(imap_io *io, int own_io) {
     /* Smallest possible entry is 1 id byte + 8 + 8 + 8 + 1 + 1 + 4 = 31 bytes.
      * Reject an inflated count before allocating anything for it. */
     if ((uint64_t)nsec * 31ull > flen) goto footfail;
-    uint8_t *dira = NULL, *dirb = NULL, *ma = NULL, *mb = NULL;
-    uint64_t dira_n = 0, dirb_n = 0, ma_n = 0, mb_n = 0;
+    uint8_t *dira = NULL, *dirax = NULL, *dirb = NULL, *ma = NULL, *mb = NULL;
+    uint64_t dira_n = 0, dirax_n = 0, dirb_n = 0, ma_n = 0, mb_n = 0;
     int seen_runs = 0;
     for (uint32_t i = 0; i < nsec; i++) {
         if (end - p < 1) goto footfail;
@@ -614,6 +687,7 @@ imap_file *imap_open_io(imap_io *io, int own_io) {
 
         uint8_t **dst = NULL; uint64_t *dstn = NULL;
         if      (!strcmp(id, "dir.a")) { dst = &dira; dstn = &dira_n; }
+        else if (!strcmp(id, "dir.a.max")) { dst = &dirax; dstn = &dirax_n; }
         else if (!strcmp(id, "dir.b")) { dst = &dirb; dstn = &dirb_n; }
         else if (!strcmp(id, "mem.a")) { dst = &ma;   dstn = &ma_n;   }
         else if (!strcmp(id, "mem.b")) { dst = &mb;   dstn = &mb_n;   }
@@ -647,6 +721,7 @@ imap_file *imap_open_io(imap_io *io, int own_io) {
     free(foot); foot = NULL;
 
     if (!dira || dira_n % IMAP_DIRA_ENTRY) goto tablefail;
+    if (!dirax || dirax_n != (dira_n / IMAP_DIRA_ENTRY) * 8) goto tablefail;
     f->n_chunks = (uint32_t)(dira_n / IMAP_DIRA_ENTRY);
     f->chunks = calloc(f->n_chunks ? f->n_chunks : 1, sizeof *f->chunks);
     if (!f->chunks) goto tablefail;
@@ -677,6 +752,9 @@ imap_file *imap_open_io(imap_io *io, int own_io) {
         if (c->a_min > (uint64_t)INT64_MAX || c->b_min > (uint64_t)INT64_MAX ||
             c->base > (uint64_t)INT64_MAX) goto tablefail;
     }
+    f->dira_max = malloc((f->n_chunks ? f->n_chunks : 1) * sizeof *f->dira_max);
+    if (!f->dira_max) goto tablefail;
+    for (uint32_t i = 0; i < f->n_chunks; i++) f->dira_max[i] = ld64(dirax + (size_t)i * 8);
     if (dirb && dirb_n == (uint64_t)f->n_chunks * IMAP_DIRB_ENTRY) {
         f->dirb_id  = malloc((f->n_chunks ? f->n_chunks : 1) * sizeof *f->dirb_id);
         f->dirb_max = malloc((f->n_chunks ? f->n_chunks : 1) * sizeof *f->dirb_max);
@@ -711,14 +789,21 @@ imap_file *imap_open_io(imap_io *io, int own_io) {
     /* mem.a ranges index dir.a: one member each, a_min increasing, extents disjoint */
     for (uint32_t mi = 0; mi < f->n_mem[0]; mi++) {
         const imap_member *m = &f->mem[0][mi];
+        uint64_t run_max = 0;
         for (uint32_t k = 0; k < m->n_chunks; k++) {
-            const imap_chunk *c = &f->chunks[m->first_chunk + k];
+            uint32_t pos = m->first_chunk + k;
+            const imap_chunk *c = &f->chunks[pos];
+            uint64_t end = c->a_min + c->a_span;
             if (c->a_member != mi) goto tablefail;
             if (k) {
-                const imap_chunk *pc = &f->chunks[m->first_chunk + k - 1];
-                if (c->a_min < pc->a_min + pc->a_span) goto tablefail;
+                const imap_chunk *pc = &f->chunks[pos - 1];
+                if (c->a_min < pc->a_min) goto tablefail;
+                /* order a cuts along a, so a member's chunks cannot overlap there */
+                if (f->order == IMAP_ORDER_A && c->a_min < pc->a_min + pc->a_span) goto tablefail;
             }
-            if (c->a_min + c->a_span > m->length) goto tablefail;
+            if (end > m->length) goto tablefail;
+            if (k == 0 || end > run_max) run_max = end;
+            if (f->dira_max[pos] != run_max) goto tablefail;
         }
     }
     if (f->dirb_id) {
@@ -747,13 +832,13 @@ imap_file *imap_open_io(imap_io *io, int own_io) {
             }
         }
     }
-    free(dira); free(dirb); free(ma); free(mb);
+    free(dira); free(dirax); free(dirb); free(ma); free(mb);
     return f;
 
 footfail:
     free(foot);
 tablefail:
-    free(dira); free(dirb); free(ma); free(mb);
+    free(dira); free(dirax); free(dirb); free(ma); free(mb);
 fail:
     imap_close(f);      /* honours own_io, so a failed imap_open_io(io,1) frees io */
     return NULL;
@@ -771,7 +856,7 @@ void imap_close(imap_file *f) {
         for (uint32_t i = 0; i < f->n_mem[ax]; i++) free(f->mem[ax][i].name);
         free(f->mem[ax]); free(f->by_name[ax]);
     }
-    free(f->chunks); free(f->dirb_id); free(f->dirb_max); free(f->schema);
+    free(f->chunks); free(f->dirb_id); free(f->dirb_max); free(f->dira_max); free(f->schema);
     if (f->own_io) imap_io_close(f->io);
     free(f);
 }
@@ -922,25 +1007,28 @@ int imap_query_a(imap_file *f, uint32_t m, int64_t lo, int64_t hi,
     *out = NULL; *n = 0;
     if (st) memset(st, 0, sizeof *st);
     const imap_member *mem = &f->mem[0][m];
-    /* first chunk of the member whose extent ends after lo: extents are disjoint and
-     * increasing within a member (validated at open), so this is a binary search */
-    uint32_t lo_i = mem->first_chunk, hi_i = mem->first_chunk + mem->n_chunks;
+    uint32_t first = mem->first_chunk, end = mem->first_chunk + mem->n_chunks;
+    /* last dir.a position in this member with a_min < hi */
+    uint32_t lo_i = first, hi_i = end;
     while (lo_i < hi_i) {
         uint32_t mid = lo_i + (hi_i - lo_i) / 2;
-        const imap_chunk *c = &f->chunks[mid];
-        if ((int64_t)(c->a_min + c->a_span) <= lo) lo_i = mid + 1; else hi_i = mid;
+        if ((int64_t)f->chunks[mid].a_min < hi) lo_i = mid + 1; else hi_i = mid;
     }
     hitvec v = {0}; imap_run *buf = NULL; uint32_t bufn = 0; int rc = 0;
-    for (uint32_t ci = lo_i; ci < mem->first_chunk + mem->n_chunks; ci++) {
-        if ((int64_t)f->chunks[ci].a_min >= hi) break;
+    /* Walk backwards; dir.a.max bounds a_end of every chunk at or before a position.
+     * Under order a the member's chunks are disjoint and this stops after one step;
+     * under order b they overlap and the walk covers exactly the ones that might. */
+    for (uint32_t j = lo_i; j > first; j--) {
+        uint32_t pos = j - 1;
+        if ((int64_t)f->dira_max[pos] <= lo) break;
+        const imap_chunk *c = &f->chunks[pos];
         if (st) st->chunks_examined++;
-        if (scan_chunk(f, ci, 0, lo, hi, &buf, &bufn, &v, st) != 0) { rc = -1; break; }
+        if ((int64_t)(c->a_min + c->a_span) <= lo) continue;
+        if (scan_chunk(f, pos, 0, lo, hi, &buf, &bufn, &v, st) != 0) { rc = -1; break; }
     }
     free(buf);
     if (rc != 0) { free(v.p); return -1; }
-    /* Chunks are cut in axis-a order, so results are a-ordered across chunks; under
-     * order b they are b-ordered within one, so sort.  a is unique within a member. */
-    if (f->order == IMAP_ORDER_B && v.n > 1) qsort(v.p, v.n, sizeof *v.p, cmp_hit_a);
+    if (v.n > 1) qsort(v.p, v.n, sizeof *v.p, cmp_hit_a);   /* a is unique within a member */
     *out = v.p; *n = v.n;
     return 0;
 }

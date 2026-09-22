@@ -166,14 +166,30 @@ universal column axis one sequence's consecutive runs are separated by every oth
 lineage's novel columns, so a-order produces large b jumps that b-order avoids. Hence
 `hal2.edge` is `order a` and `taffy.tui` is `order b`.
 
-Under `order b`, chunks are still *cut* in axis-a order (so `dir.a` extents stay disjoint
-and binary-searchable) and each chunk is then sorted by `(b, a)` internally — the layout
-`.tui` already uses. Axis a is then `zigzag`, and a `query_a` result must be re-sorted.
+**Chunks are cut along the order axis.** Under `order a` runs arrive in axis-a order and are
+cut as they come. Under `order b` a whole axis-a member is buffered, sorted by
+`(b_member, b, a)`, and cut in that order — which is what `.tui` does (`tui.c` phase 2: a
+sequence's runs are colinear-merged in `t` order, the whole sequence is sorted by `g`, then
+cut). Axis a is then `zigzag`, and a member's chunks overlap on axis a, which `dir.a.max`
+(section 2.2) handles.
+
+An earlier draft said order b cuts in axis-a order and sorts only *within* each chunk. That
+is not equivalent, and it was wrong: on a universal column axis a sequence's consecutive runs
+jump across columns at every rearrangement, so the `bspan` cap fired almost every run. On the
+rodent `.tui` (85M runs, T = 2.73 × 10^9) that produced 44.6M chunks — under two runs each —
+and a file 22× the size of the `.tui`. Cutting along b gives 36,709 chunks and a file 4%
+*smaller* than the `.tui`.
+
+`bspan` caps a chunk's span on axis b in both orders, but plays a different role in each.
+Under order a it bounds the *non-cut* axis, which is what keeps reverse-lookup fan-out near
+one. Under order b it bounds the cut axis itself, so one chunk never covers more than `bspan`
+columns — the role of `.tui`'s `TUI_CHUNK_G_MAX`, which cut a full-chromosome lift to a
+distant target from 196 s to 1.7 s.
 
 **Implementation status.** The C library implements both orders with `seqbound both`,
 recorded in header feature bit 0 (section 2). It rejects a chunk whose extent would not fit
-the u32 span fields rather than letting one wrap. Order b is written by cutting chunks in
-axis-a order as usual and sorting each one by `(b, a)` before encoding.
+the u32 span fields rather than letting one wrap. Under order b the writer holds one axis-a
+member's runs in memory at a time, which is the same bound `.tui`'s own builder has.
 
 ---
 
@@ -184,7 +200,7 @@ Little-endian throughout. Sections are 8-byte aligned.
 ```
 HEADER  (64 B, at offset 0 — sized so format sniffers that read 64 bytes see all of it)
   0   u8[8]   magic  = "IMAP\x1A\x0D\x0A\x00"
-  8   u32     imap_major         2; a reader requires an exact match
+  8   u32     imap_major         3; a reader requires an exact match
   12  u32     imap_minor         0
   16  u64     feature_flags      unknown bit set => reader MUST refuse
                                  bit 0: runs within a chunk are in order b
@@ -234,12 +250,13 @@ scratch; the cost of reserving them now is these two lines.
 
 ### 2.2 Chunk directory `dir.a` — fixed width, uncompressed, binary-searchable
 
-**64 bytes** per chunk, sorted by `(a_member, a_min)`, with the extents of one member's
-chunks disjoint and increasing — which is what makes a binary search over a member's range
-valid. The writer sorts the directory at close (chunks are addressed by payload offset, so
-reordering the directory moves nothing), and requires each axis-a member's runs to arrive
-in non-decreasing `a` without overlap *across* chunks, not merely within one. A reader
-refuses a file where either property fails. Little-endian, in this order:
+**64 bytes** per chunk, sorted by `(a_member, a_min)`. Under `order a` a member's chunks are
+also disjoint on axis a, since they were cut along it; under `order b` they generally
+overlap. The writer sorts the directory at close (chunks are addressed by payload offset, so
+reordering the directory moves nothing), and requires each axis-a member's runs to arrive in
+non-decreasing `a` without overlap *across* chunks, not merely within one — axis a is a
+partial function at the level of runs whatever the chunk layout. Little-endian, in this
+order:
 
 ```
    0  u32 a_member       4  u32 b_member
@@ -302,6 +319,15 @@ makes skipping a chunk on its extent sound; a reader rejects a chunk that violat
 
 Left uncompressed so it can be `pread` and binary-searched in place. A 1.3 Gb genome at 8192
 runs/chunk is ~3,200 chunks ≈ 205 KB.
+
+### 2.2a `dir.a.max` — the axis-a early-exit bound
+
+One u64 per `dir.a` position: the running maximum of `a_min + a_span` over the entries at or
+before it, **reset at each axis-a member** — the axis-a twin of `dir.b`'s prefix max. It is
+what lets `query_a` walk backwards over chunks that overlap on axis a and stop as soon as
+nothing earlier can reach the window. Under order a the member's chunks are disjoint and the
+walk ends after one step. A reader recomputes it at open and refuses a mismatch, and under
+order a additionally refuses overlapping extents within a member.
 
 ### 2.3 Chunk directory `dir.b` — a permutation, not a copy
 
@@ -367,9 +393,12 @@ every run overlapping the window **clipped to it**, with the other axis mapped t
 run's strand. For a window of offsets `[o1, o2)` into a run of length `len`, the other axis
 gets `[o1, o2)` on the forward strand and `[len-o2, len-o1)` on the reverse strand.
 
-- **axis a** (`query_a`): binary search the member's `dir.a` range for the first chunk whose
-  extent ends after `lo`; scan forward while `a_min < hi`. Results are in `a` order and never
-  overlap, because axis a is a partial function. A point query decodes exactly one chunk.
+- **axis a** (`query_a`): binary search the member's `dir.a` range for the last entry with
+  `a_min < hi`; walk backwards, decoding each chunk whose extent overlaps the window, and stop
+  at the first entry whose `dir.a.max <= lo`. Results are sorted by `a` and never overlap,
+  because axis a is a partial function. Under order a a point query decodes exactly one
+  chunk; under order b it decodes the few whose axis-a extents overlap (4.3 on average on the
+  fish edge, against 1.18 for an axis-b point query — the trade order b makes).
 - **axis b** (`query_b`): binary search the member's `dir.b` range for the last entry with
   `b_min < hi`; walk backwards, decoding each chunk whose extent overlaps the window, and
   stop at the first entry whose `prefix_max_b_end <= lo`. Results are sorted by
@@ -485,6 +514,20 @@ B/run), exactly as the order table above predicts. **Written in `order b` — th
 profile — it is 267,804 bytes against the `.tui`'s 268,906: parity, 0.4% smaller**, with the
 same three checks at zero mismatches. With per-stream compression it is **263,492 bytes,
 2.0% smaller than the `.tui`**.
+
+The same check on the rodent universal index (`vgp-577way-v1-MuridaeAnc3`, regenerated in
+tui format 0.3: 11,698 sequences, 84,970,744 runs, T = 2,731,506,489 columns):
+
+| | `.tui` | `.imap`, order b |
+|---|---|---|
+| size | 235,525,448 bytes | **226,116,332 bytes (−4.0%)** |
+| forward lift, 11,243 whole sequences (1.22 × 10^9 bases) | 0.361 s | 0.050 s |
+| forward lift, 2,000 random windows | 0.113 s | 0.056 s |
+| reverse lift, 8.02M columns × 5 genomes | 5.57 s | 0.455 s |
+| every run of every sequence | 9.13 s | 14.4 s |
+
+Run identity, forward lift and reverse lift all agree exactly. Transcoding took 42 s and
+0.58 GB peak memory.
 
 Still open, to be measured rather than argued:
 

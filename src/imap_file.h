@@ -35,7 +35,7 @@
 
 /* On-disk format version.  There is no reader for earlier drafts: a file written
  * before a bump must be regenerated (the .tui policy). */
-#define IMAP_FORMAT_MAJOR 2
+#define IMAP_FORMAT_MAJOR 3
 
 /* One chunk's directory entry, in memory (native types; serialized explicitly). */
 typedef struct {
