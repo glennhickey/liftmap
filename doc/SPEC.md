@@ -535,6 +535,22 @@ tui format 0.3: 11,698 sequences, 84,970,744 runs, T = 2,731,506,489 columns):
 Run identity, forward lift and reverse lift all agree exactly. Transcoding took 42 s and
 0.58 GB peak memory.
 
+And on the fish-subtree universal index (`vgp-577way-v1.RayFinnedFishesAnc64`, regenerated
+in tui format 0.3: 57 genomes, 120,805 sequences, 846,503,338 runs, T = 2,655,269,561):
+
+| | `.tui` | `.imap`, order b |
+|---|---|---|
+| chunks | 354,369 | **354,369** — identical, so the layout matches rather than approximates |
+| size | 1,956,422,670 bytes | **1,911,774,892 bytes (−2.3%)** |
+| forward lift, 118,931 whole sequences (2.25 × 10^9 bases) | 7.13 s | 2.76 s |
+| forward lift, 2,000 random windows | 0.383 s | 0.355 s |
+| reverse lift, 8.04M columns × 57 genomes | 40.3 s | 3.58 s |
+| every run of every sequence | 100.5 s | 150.4 s |
+
+All three checks agree exactly: 846,503,338 runs, 2,245,605,736 bases of forward lift and
+50,889,391 reverse matches. Transcoding took 766 s at 4.8 GB peak, most of it the writer
+holding the ~1.9 GB payload (see the known limit above).
+
 Still open, to be measured rather than argued:
 
 1. *(settled: order a for HAL edges, order b for universal columns — table in 1.3)*
