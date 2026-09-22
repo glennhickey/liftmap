@@ -24,7 +24,7 @@ int main(int argc, char **argv) {
 
     imap_writer *w = imap_writer_open(argv[2], "hal2.edge", "imap 1\nprofile hal2.edge 1\n");
     if (!w) { fprintf(stderr,"writer open failed\n"); return 1; }
-    if (imap_writer_set_params(w,(uint32_t)atoi(argv[3]),1000000,IMAP_CODEC_ZLIB)!=0) return 1;
+    if (imap_writer_set_params(w,(uint32_t)atoi(argv[3]),1000000,IMAP_CODEC_DEFLATE)!=0) return 1;
     char nm[64];
     for (int32_t i=0;i<namem;i++){ snprintf(nm,sizeof nm,"achr%d",i); if(imap_writer_add_member(w,0,nm,1ULL<<40)<0) return 1; }
     for (int32_t i=0;i<nbmem;i++){ snprintf(nm,sizeof nm,"bscaf%d",i); if(imap_writer_add_member(w,1,nm,1ULL<<40)<0) return 1; }

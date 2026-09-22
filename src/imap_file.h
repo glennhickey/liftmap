@@ -29,8 +29,13 @@
 #define IMAP_FEAT_ORDER_B   (1ull << 0)     /* runs within a chunk are in order b */
 #define IMAP_FEAT_KNOWN     (IMAP_FEAT_ORDER_B)
 
-#define IMAP_CODEC_NONE 0
-#define IMAP_CODEC_ZLIB 1
+/* Chunk codecs (SPEC 2.2).  A chunk's four streams are compressed independently. */
+#define IMAP_CODEC_NONE     0     /* every stream stored verbatim */
+#define IMAP_CODEC_DEFLATE  1     /* raw deflate per stream, verbatim where it would not shrink */
+
+/* On-disk format version.  There is no reader for earlier drafts: a file written
+ * before a bump must be regenerated (the .tui policy). */
+#define IMAP_FORMAT_MAJOR 2
 
 /* One chunk's directory entry, in memory (native types; serialized explicitly). */
 typedef struct {

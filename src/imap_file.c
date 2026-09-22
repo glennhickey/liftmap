@@ -56,6 +56,38 @@ static int vec_put32(vec *v, uint32_t x) { uint8_t b[4]; st32(b,x); return vec_p
 static int vec_put64(vec *v, uint64_t x) { uint8_t b[8]; st64(b,x); return vec_put(v,b,8); }
 static void vec_free(vec *v) { free(v->p); v->p=NULL; v->n=v->cap=0; }
 
+/* ------------------------------------------------ per-stream raw deflate
+ * Raw deflate (no zlib wrapper): each stream would otherwise pay a 2-byte header and a
+ * 4-byte Adler checksum, and a file has four streams per chunk and ~10^4 chunks.  The
+ * section CRC already covers integrity. */
+static int raw_deflate(const uint8_t *in, size_t n, uint8_t **out, size_t *outn) {
+    z_stream z; memset(&z, 0, sizeof z);
+    if (deflateInit2(&z, 9, Z_DEFLATED, -15, 9, Z_DEFAULT_STRATEGY) != Z_OK) return -1;
+    uLong cap = deflateBound(&z, (uLong)n);
+    uint8_t *buf = malloc(cap ? cap : 1);
+    if (!buf) { deflateEnd(&z); return -1; }
+    z.next_in = (Bytef *)in; z.avail_in = (uInt)n;
+    z.next_out = buf; z.avail_out = (uInt)cap;
+    int rc = deflate(&z, Z_FINISH);
+    size_t got = cap - z.avail_out;
+    deflateEnd(&z);
+    if (rc != Z_STREAM_END) { free(buf); return -1; }
+    *out = buf; *outn = got;
+    return 0;
+}
+
+/* Inflate exactly `want` bytes from exactly `n` bytes of input, or fail. */
+static int raw_inflate(const uint8_t *in, size_t n, uint8_t *out, size_t want) {
+    z_stream z; memset(&z, 0, sizeof z);
+    if (inflateInit2(&z, -15) != Z_OK) return -1;
+    z.next_in = (Bytef *)in; z.avail_in = (uInt)n;
+    z.next_out = out; z.avail_out = (uInt)want;
+    int rc = inflate(&z, Z_FINISH);
+    int ok = rc == Z_STREAM_END && z.avail_out == 0 && z.avail_in == 0;
+    inflateEnd(&z);
+    return ok ? 0 : -1;
+}
+
 /* ================================================================== WRITER */
 
 typedef struct {
@@ -87,7 +119,7 @@ imap_writer *imap_writer_open(const char *path, const char *profile, const char 
     w->path = strdup(path);
     w->profile = strdup(profile ? profile : "");
     w->schema = strdup(schema ? schema : "");
-    w->count = 8192; w->bspan = 1000000; w->codec = IMAP_CODEC_ZLIB; w->order = IMAP_ORDER_A;
+    w->count = 8192; w->bspan = 1000000; w->codec = IMAP_CODEC_DEFLATE; w->order = IMAP_ORDER_A;
     if (!w->path || !w->profile || !w->schema) { imap_writer_abort(w); return NULL; }
     return w;
 }
@@ -95,7 +127,7 @@ imap_writer *imap_writer_open(const char *path, const char *profile, const char 
 int imap_writer_set_params(imap_writer *w, uint32_t count, uint64_t bspan, int codec) {
     if (!w || w->n_chunks || w->n_pend) return -1;      /* only before any run */
     if (count == 0 || count > IMAP_MAX_CHUNK_RUNS) return -1;
-    if (codec != IMAP_CODEC_NONE && codec != IMAP_CODEC_ZLIB) return -1;
+    if (codec != IMAP_CODEC_NONE && codec != IMAP_CODEC_DEFLATE) return -1;
     w->count = count; w->bspan = bspan; w->codec = codec; return 0;
 }
 
@@ -136,29 +168,37 @@ static int flush_chunk(imap_writer *w) {
     imap_buf st[IMAP_N_STREAMS];
     if (imap_encode_chunk(w->pend, w->n_pend, w->order, st) != 0) return -1;
 
-    /* blob = u32 x4 stream lengths, then the streams */
-    vec blob = {0};
+    /* Chunk blob (SPEC 2.2): u32 raw_len[4], u32 stored_len[4], then the four stored
+     * streams.  A stream is deflated only where that makes it smaller; otherwise it is
+     * stored verbatim, and stored_len == raw_len says so -- there is no separate flag. */
+    uint8_t *packed[IMAP_N_STREAMS] = {0};
+    size_t   stored[IMAP_N_STREAMS];
+    uint64_t rawsum = 0;
     int bad = 0;
-    for (int i = 0; i < IMAP_N_STREAMS; i++) bad |= vec_put32(&blob, (uint32_t)st[i].n);
-    for (int i = 0; i < IMAP_N_STREAMS; i++) bad |= vec_put(&blob, st[i].p, st[i].n);
-    for (int i = 0; i < IMAP_N_STREAMS; i++) imap_buf_free(&st[i]);
-    if (bad || blob.n > IMAP_MAX_CHUNK_RAW) { vec_free(&blob); return -1; }
-
-    const uint8_t *body = blob.p; size_t bodylen = blob.n;
-    uint8_t *z = NULL;
-    if (w->codec == IMAP_CODEC_ZLIB) {
-        uLongf zl = compressBound((uLong)blob.n);
-        z = malloc(zl ? zl : 1);
-        if (!z || compress2(z, &zl, blob.p, (uLong)blob.n, 9) != Z_OK) {
-            free(z); vec_free(&blob); return -1;
+    for (int i = 0; i < IMAP_N_STREAMS; i++) {
+        rawsum += st[i].n;
+        stored[i] = st[i].n;
+        if (w->codec == IMAP_CODEC_DEFLATE && st[i].n > 0) {
+            uint8_t *z = NULL; size_t zn = 0;
+            if (raw_deflate(st[i].p, st[i].n, &z, &zn) != 0) { bad = 1; break; }
+            if (zn < st[i].n) { packed[i] = z; stored[i] = zn; } else free(z);
         }
-        body = z; bodylen = zl;
     }
+    vec blob = {0};
+    if (!bad && 16 + rawsum > IMAP_MAX_CHUNK_RAW) bad = 1;
+    for (int i = 0; !bad && i < IMAP_N_STREAMS; i++) bad |= vec_put32(&blob, (uint32_t)st[i].n);
+    for (int i = 0; !bad && i < IMAP_N_STREAMS; i++) bad |= vec_put32(&blob, (uint32_t)stored[i]);
+    for (int i = 0; !bad && i < IMAP_N_STREAMS; i++)
+        bad |= vec_put(&blob, packed[i] ? packed[i] : st[i].p, stored[i]);
+    for (int i = 0; i < IMAP_N_STREAMS; i++) { free(packed[i]); imap_buf_free(&st[i]); }
+    if (bad) { vec_free(&blob); return -1; }
+    const uint8_t *body = blob.p; size_t bodylen = blob.n;
+    uint32_t rawlen32 = (uint32_t)(16 + rawsum);
 
     if (w->n_chunks == w->cap_chunks) {
         uint32_t cap = w->cap_chunks ? w->cap_chunks*2 : 256;
         imap_chunk *c = realloc(w->chunks, cap * sizeof *c);
-        if (!c) { free(z); vec_free(&blob); return -1; }
+        if (!c) { vec_free(&blob); return -1; }
         w->chunks = c; w->cap_chunks = cap;
     }
     /* extents from min/max rather than first/last: under order b the runs are no
@@ -170,7 +210,7 @@ static int flush_chunk(imap_writer *w) {
     }
     uint64_t a_span64 = (uint64_t)(amax - amin);
     uint64_t b_span64 = w->pend_bmax - w->pend_bmin;
-    if (a_span64 > 0xFFFFFFFFull || b_span64 > 0xFFFFFFFFull) { free(z); vec_free(&blob); return -1; }
+    if (a_span64 > 0xFFFFFFFFull || b_span64 > 0xFFFFFFFFull) { vec_free(&blob); return -1; }
 
     imap_chunk *c = &w->chunks[w->n_chunks];
     memset(c, 0, sizeof *c);
@@ -186,12 +226,12 @@ static int flush_chunk(imap_writer *w) {
             : (uint64_t)w->pend[0].a;
     c->off = w->runs.n;
     c->clen = (uint32_t)bodylen;
-    c->rawlen = (uint32_t)blob.n;
+    c->rawlen = rawlen32;
     c->n_runs = w->n_pend;
     c->codec = (uint32_t)w->codec;
 
     int rc = vec_put(&w->runs, body, bodylen);
-    free(z); vec_free(&blob);
+    vec_free(&blob);
     if (rc != 0) return -1;
 
     w->n_chunks++;
@@ -383,7 +423,7 @@ int imap_writer_close(imap_writer *w) {
         uint8_t hdr[IMAP_HEADER_SIZE];
         memset(hdr, 0, sizeof hdr);
         memcpy(hdr, IMAP_MAGIC, 8);
-        st32(hdr + 8, 1); st32(hdr + 12, 0);
+        st32(hdr + 8, IMAP_FORMAT_MAJOR); st32(hdr + 12, 0);
         st64(hdr + 16, w->order == IMAP_ORDER_B ? IMAP_FEAT_ORDER_B : 0);
         strncpy((char *)hdr + 24, w->profile, 31);
         hdr_crc = crc_all(hdr, sizeof hdr);
@@ -537,7 +577,7 @@ imap_file *imap_open_io(imap_io *io, int own_io) {
      * every chunk decodes: a single flipped bit used to make some chunks decode, without
      * complaint, into different runs. */
     if (crc_all(hdr, IMAP_HEADER_SIZE) != ld32(tr + 20)) goto fail;
-    if (ld32(hdr + 8) != 1) goto fail;                       /* major */
+    if (ld32(hdr + 8) != IMAP_FORMAT_MAJOR) goto fail;       /* exact: no older reader */
     uint64_t feat = ld64(hdr + 16);
     if (feat & ~IMAP_FEAT_KNOWN) goto fail;                 /* a feature we don't know */
     f->order = (feat & IMAP_FEAT_ORDER_B) ? IMAP_ORDER_B : IMAP_ORDER_A;
@@ -619,7 +659,7 @@ imap_file *imap_open_io(imap_io *io, int own_io) {
         c->base     = ld64(e + 32); c->off      = ld64(e + 40);
         c->clen     = ld32(e + 48); c->rawlen   = ld32(e + 52);
         c->n_runs   = ld32(e + 56); c->codec = ld32(e + 60);
-        if (c->codec != IMAP_CODEC_NONE && c->codec != IMAP_CODEC_ZLIB) goto tablefail;
+        if (c->codec != IMAP_CODEC_NONE && c->codec != IMAP_CODEC_DEFLATE) goto tablefail;
         /* n_runs sizes the decode buffer, so it must be answerable to the bytes that
          * are actually there: every run costs at least one varint byte in each of the
          * a, b and len streams plus a strand bit, after the 16-byte stream header.
@@ -627,8 +667,11 @@ imap_file *imap_open_io(imap_io *io, int own_io) {
         if (c->n_runs == 0 || c->n_runs > IMAP_MAX_CHUNK_RUNS) goto tablefail;
         if (c->rawlen > IMAP_MAX_CHUNK_RAW) goto tablefail;
         if ((uint64_t)c->rawlen < 16ull + 3ull * c->n_runs + (c->n_runs + 7ull) / 8) goto tablefail;
-        if (c->codec == IMAP_CODEC_NONE ? c->rawlen != c->clen
-            : (uint64_t)c->rawlen > (uint64_t)IMAP_ZLIB_MAX_RATIO * c->clen + 64) goto tablefail;
+        /* clen = 32 + stored bytes, rawlen = 16 + raw bytes, and stored <= raw per stream */
+        if (c->clen < 32) goto tablefail;
+        if (c->codec == IMAP_CODEC_NONE ? (uint64_t)c->clen != (uint64_t)c->rawlen + 16
+            : ((uint64_t)c->clen > (uint64_t)c->rawlen + 16 ||
+               (uint64_t)c->rawlen > (uint64_t)IMAP_ZLIB_MAX_RATIO * c->clen + 64)) goto tablefail;
         if (c->off > f->runs_len || c->clen > f->runs_len - c->off) goto tablefail;
         /* a_min, b_min and base become int64 decode bases. */
         if (c->a_min > (uint64_t)INT64_MAX || c->b_min > (uint64_t)INT64_MAX ||
@@ -761,49 +804,58 @@ int32_t imap_member_by_name(const imap_file *f, int axis, const char *name) {
     return -1;
 }
 
+/* Decode a chunk's streams and check every run lies inside the chunk's declared
+ * extents.  Containment is what makes skipping a chunk on its extent sound: a run
+ * outside the declared range could be missed by a query that skipped the chunk. */
+static int decode_checked(const imap_file *f, const imap_chunk *c,
+                          const imap_buf st[IMAP_N_STREAMS], imap_run *out) {
+    int64_t base_a = f->order == IMAP_ORDER_A ? (int64_t)c->a_min : (int64_t)c->base;
+    int64_t base_b = f->order == IMAP_ORDER_A ? (int64_t)c->base  : (int64_t)c->b_min;
+    if (imap_decode_chunk(st, c->n_runs, f->order, base_a, base_b, out) != 0) return -1;
+    uint64_t a_hi = c->a_min + c->a_span, b_hi = c->b_min + c->b_span;
+    for (uint32_t k = 0; k < c->n_runs; k++) {
+        const imap_run *r = &out[k];
+        if ((uint64_t)r->a < c->a_min || (uint64_t)(r->a + r->len) > a_hi ||
+            (uint64_t)r->b < c->b_min || (uint64_t)(r->b + r->len) > b_hi) return -1;
+    }
+    return 0;
+}
+
 int imap_read_chunk(imap_file *f, uint32_t i, imap_run *out) {
     const imap_chunk *c = imap_chunk_at(f, i);
-    if (!c || !out) return -1;
-    uint8_t *raw = malloc(c->clen ? c->clen : 1);
+    if (!c || !out || c->clen < 32) return -1;
+    uint8_t *raw = malloc(c->clen);
     if (!raw) return -1;
     if (imap_pread(f->io, raw, (int64_t)(f->runs_off + c->off), (int64_t)c->clen) != 0) {
         free(raw); return -1;
     }
-    uint8_t *body = raw; uint32_t bodylen = c->clen;
-    uint8_t *inf = NULL;
-    if (c->codec == IMAP_CODEC_ZLIB) {
-        inf = malloc(c->rawlen ? c->rawlen : 1);
-        uLongf got = c->rawlen;
-        if (!inf || uncompress(inf, &got, raw, c->clen) != Z_OK || got != c->rawlen) {
-            free(raw); free(inf); return -1;
-        }
-        body = inf; bodylen = c->rawlen;
+    /* Blob (SPEC 2.2): u32 raw_len[4], u32 stored_len[4], the four stored streams.
+     * Every length is off disk; each is checked against the directory entry, which was
+     * itself bounded at open, before anything is allocated from it. */
+    uint32_t rl[IMAP_N_STREAMS], sl[IMAP_N_STREAMS];
+    uint64_t rsum = 0, ssum = 0;
+    int ok = 1;
+    for (int k = 0; k < IMAP_N_STREAMS; k++) {
+        rl[k] = ld32(raw + 4*k);
+        sl[k] = ld32(raw + 16 + 4*k);
+        rsum += rl[k]; ssum += sl[k];
+        if (sl[k] > rl[k]) ok = 0;                            /* never stored larger */
+        if (c->codec == IMAP_CODEC_NONE && sl[k] != rl[k]) ok = 0;
     }
-    int rc = -1;
-    if (bodylen >= 16) {
-        uint32_t sl[IMAP_N_STREAMS];
-        uint64_t tot = 16;
-        for (int k = 0; k < IMAP_N_STREAMS; k++) { sl[k] = ld32(body + 4*k); tot += sl[k]; }
-        if (tot <= bodylen) {
-            imap_buf st[IMAP_N_STREAMS];
-            const uint8_t *q = body + 16;
-            for (int k = 0; k < IMAP_N_STREAMS; k++) {
-                st[k].p = (uint8_t *)q; st[k].n = sl[k]; st[k].cap = sl[k];
-                q += sl[k];
-            }
-            int64_t base_a = f->order == IMAP_ORDER_A ? (int64_t)c->a_min : (int64_t)c->base;
-            int64_t base_b = f->order == IMAP_ORDER_A ? (int64_t)c->base  : (int64_t)c->b_min;
-            rc = imap_decode_chunk(st, c->n_runs, f->order, base_a, base_b, out);
-            /* Containment is what makes skipping a chunk on its extent sound: a run
-             * outside the declared range could be missed by a query that skipped it. */
-            uint64_t a_hi = c->a_min + c->a_span, b_hi = c->b_min + c->b_span;
-            for (uint32_t k = 0; rc == 0 && k < c->n_runs; k++) {
-                const imap_run *r = &out[k];
-                if ((uint64_t)r->a < c->a_min || (uint64_t)(r->a + r->len) > a_hi ||
-                    (uint64_t)r->b < c->b_min || (uint64_t)(r->b + r->len) > b_hi) rc = -1;
-            }
-        }
+    if (!ok || rsum + 16 != c->rawlen || ssum + 32 != c->clen) { free(raw); return -1; }
+
+    uint8_t *inf = malloc(rsum ? (size_t)rsum : 1);
+    if (!inf) { free(raw); return -1; }
+    imap_buf st[IMAP_N_STREAMS];
+    const uint8_t *q = raw + 32;
+    uint8_t *o = inf;
+    for (int k = 0; ok && k < IMAP_N_STREAMS; k++) {
+        if (sl[k] == rl[k]) memcpy(o, q, rl[k]);              /* stored verbatim */
+        else if (raw_inflate(q, sl[k], o, rl[k]) != 0) ok = 0;
+        st[k].p = o; st[k].n = rl[k]; st[k].cap = rl[k];
+        q += sl[k]; o += rl[k];
     }
+    int rc = ok ? decode_checked(f, c, st, out) : -1;
     free(raw); free(inf);
     return rc;
 }

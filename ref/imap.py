@@ -170,11 +170,28 @@ def decode_chunk(streams, n, base_a, base_b, order="a"):
     return a, b, ln, rev
 
 
-# --- block compression (SPEC 1.2: each stream compressed independently) -----
+# --- block compression (SPEC 2.2: each stream independently, raw deflate) --------
+
+def _raw_deflate(b, level=9):
+    c = zlib.compressobj(level, zlib.DEFLATED, -15, 9)
+    return c.compress(b) + c.flush()
+
 
 def compress_streams(streams, level=9):
-    return [zlib.compress(s, level) for s in streams]
+    """Return (raw_len, stored) per stream.  A stream is deflated only where that makes it
+    smaller; otherwise it is stored verbatim, and stored length == raw length says so."""
+    out = []
+    for s in streams:
+        z = _raw_deflate(s, level) if s else b""
+        out.append((len(s), z if len(z) < len(s) else s))
+    return out
 
 
-def decompress_streams(blobs):
-    return [zlib.decompress(s) for s in blobs]
+def decompress_streams(packed):
+    res = []
+    for raw_len, stored in packed:
+        if len(stored) == raw_len:
+            res.append(stored)
+        else:
+            res.append(zlib.decompressobj(-15).decompress(stored))
+    return res

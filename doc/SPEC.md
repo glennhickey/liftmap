@@ -97,9 +97,13 @@ Encodings: `uvarint` = LEB128 of a non-negative value. `zigzag` = LEB128 of
 `len<<1|strand`): packing destroys the length stream's delta structure. Measured on real HAL
 edges the split is 19–22% smaller overall while the strand bitmap costs 0.002 B/run.
 
-**Each stream is compressed independently**, not concatenated then compressed. Measured gain
-is modest but free and grows as chunks shrink: −0.6% at 65536 runs, −4.1% at 8192. Stream
-order has no measurable effect on size, so it is fixed by declaration order for determinism.
+**Each stream is compressed independently**, not concatenated then compressed, using raw
+deflate (no zlib wrapper: four streams per chunk and ~10^4 chunks per file make the 6-byte
+header and Adler checksum add up, and the section CRC already covers integrity). A stream is
+deflated only where that makes it smaller; otherwise it is stored verbatim. Measured in the C
+implementation against compressing each chunk as one blob: −1.5% on the fish HAL edge in
+order a, −2.9% in order b, −1.7% on the evolver `.tui` data. Stream order has no measurable
+effect on size, so it is fixed by declaration order for determinism.
 
 ### 1.3 Chunking (normative)
 
@@ -180,8 +184,8 @@ Little-endian throughout. Sections are 8-byte aligned.
 ```
 HEADER  (64 B, at offset 0 — sized so format sniffers that read 64 bytes see all of it)
   0   u8[8]   magic  = "IMAP\x1A\x0D\x0A\x00"
-  8   u32     imap_major
-  12  u32     imap_minor
+  8   u32     imap_major         2; a reader requires an exact match
+  12  u32     imap_minor         0
   16  u64     feature_flags      unknown bit set => reader MUST refuse
                                  bit 0: runs within a chunk are in order b
   24  u8[32]  profile            NUL-padded, e.g. "hal2.edge"
@@ -218,7 +222,7 @@ Open = `pread` the last 32 B, then `pread` the footer. Nothing else is read unti
     u64  off                           relative to byte 0
     u64  len                           bytes on disk
     u64  raw_len                       uncompressed
-    u8   codec                         0 none, 1 zlib  (per-section; see below)
+    u8   codec                         0 none (sections are stored; chunks carry their own)
     u8   flags
     u32  crc32
 ```
@@ -258,13 +262,22 @@ other one:
 Neither stored base is a minimum: under order a the first run is not the one with the
 smallest b, and under order b it is not the one with the smallest a.
 
-`codec` is per chunk and not inherited from the section: the `runs` section itself is stored
-uncompressed and each chunk blob inside it is compressed individually, so the reader has to
-be told which. Inferring it from `rawlen != clen` is wrong for a chunk that happens not to
-compress.
+`codec` is per chunk: `0` stores every stream verbatim, `1` raw-deflates each stream where
+that makes it smaller. The `runs` section itself is stored uncompressed.
 
-A chunk blob is `u32 len[4]` — the four stream lengths in declaration order — followed by the
-four streams; `codec` applies to that whole blob.
+A chunk blob is
+
+```
+  u32 raw_len[4]       uncompressed length of each stream, in declaration order
+  u32 stored_len[4]    bytes actually stored for it
+  the four stored streams, back to back
+```
+
+`stored_len == raw_len` means the stream is stored verbatim; `stored_len < raw_len` means it
+is raw deflate that must inflate to exactly `raw_len` bytes, consuming exactly
+`stored_len`; `stored_len > raw_len` is invalid. There is no separate flag to disagree with
+the lengths. Under `codec 0` every stream must be verbatim. In the directory,
+`clen = 32 + Σ stored_len` and `rawlen = 16 + Σ raw_len`.
 
 `a_span`/`b_span` are the *tight* extent of the chunk's runs on each axis, and `b_span` is
 what lets a reverse query skip a chunk without decompressing it. **Tightness is a validated
@@ -278,8 +291,8 @@ answerable to the bytes actually present, not merely declared:
 - `1 <= n_runs <= 2^24`, and `rawlen <= 2^30`
 - `rawlen >= 16 + 3*n_runs + ceil(n_runs/8)` — every run costs at least one varint byte
   in each of the a, b and len streams plus a strand bit, after the four-length header
-- `codec 0`: `rawlen == clen`; `codec 1` (zlib): `rawlen <= 1032*clen + 64`, deflate's
-  maximum expansion
+- `clen >= 32`; `codec 0`: `clen == rawlen + 16`; `codec 1`: `clen <= rawlen + 16` and
+  `rawlen <= 1032*clen + 64`, deflate's maximum expansion
 
 Without these a 256-byte chunk could declare two billion runs and a reader would try to
 allocate ~80 GB before discovering the streams are empty — a fuzzer found exactly that.
@@ -470,8 +483,8 @@ runs, T = 708,019 columns) was read with tui's own reader and written through th
 Written in `order a` that transcode came out 43% larger than the `.tui` (3.12 vs 2.18
 B/run), exactly as the order table above predicts. **Written in `order b` — the `taffy.tui`
 profile — it is 267,804 bytes against the `.tui`'s 268,906: parity, 0.4% smaller**, with the
-same three checks at zero mismatches. The reference codec puts per-stream compression
-another ~2.5% lower (2.098 B/run); the C writer still compresses each chunk as one blob.
+same three checks at zero mismatches. With per-stream compression it is **263,492 bytes,
+2.0% smaller than the `.tui`**.
 
 Still open, to be measured rather than argued:
 
