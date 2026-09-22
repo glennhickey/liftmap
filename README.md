@@ -1,4 +1,4 @@
-# libintervalmap
+# liftmap
 
 A small C library for **indexed pairwise interval maps**: a set of colinear ungapped *runs*
 relating intervals on one coordinate axis to intervals on another, chunked, compressed, and
@@ -18,14 +18,14 @@ sections are present. Everything else — codec, chunking, directories, containe
 
 ## Status
 
-**Draft.** `doc/SPEC.md` is the normative specification. `ref/imap.py` is a Python reference
+**Draft.** `doc/SPEC.md` is the normative specification. `ref/liftmap.py` is a Python reference
 implementation of the run codec and chunking, used to validate the spec, not to be fast.
 
 The C library does not exist yet.
 
 ## What is validated
 
-The codec and chunking in `ref/imap.py` have been round-tripped field-by-field against
+The codec and chunking in `ref/liftmap.py` have been round-tripped field-by-field against
 9,010,509 real runs taken from a HAL edge at deep vertebrate divergence
 (`GCA_024256435.1` → `SiluriformesAnc2`, from a 577-way VGP fish alignment): sequence-local
 coordinates on both axes, strand-aware b deltas, `len-1`, a strand bitmap, and per-stream

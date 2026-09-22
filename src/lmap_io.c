@@ -2,7 +2,7 @@
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
-#include "imap_io.h"
+#include "lmap_io.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -12,12 +12,12 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
-struct imap_io {
-    const imap_io_backend *be;
+struct lmap_io {
+    const lmap_io_backend *be;
     void   *ctx;
     int64_t base;      /* offset of our region within the backend */
     int64_t len;       /* size of our region */
-    imap_io *parent;   /* non-NULL for slices; borrowed */
+    lmap_io *parent;   /* non-NULL for slices; borrowed */
 };
 
 /* ------------------------------------------------------------------ file */
@@ -42,15 +42,15 @@ static void file_close(void *vctx) {
     free(c);
 }
 
-static const imap_io_backend FILE_BE = { "file", file_read, file_close };
+static const lmap_io_backend FILE_BE = { "file", file_read, file_close };
 
-imap_io *imap_io_open_file(const char *path) {
+lmap_io *lmap_io_open_file(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return NULL;
     struct stat st;
     if (fstat(fd, &st) != 0) { close(fd); return NULL; }
     file_ctx *c = (file_ctx *)malloc(sizeof *c);
-    imap_io *io = (imap_io *)calloc(1, sizeof *io);
+    lmap_io *io = (lmap_io *)calloc(1, sizeof *io);
     if (!c || !io) { free(c); free(io); close(fd); return NULL; }
     c->fd = fd;
     io->be = &FILE_BE; io->ctx = c; io->base = 0; io->len = (int64_t)st.st_size;
@@ -72,11 +72,11 @@ static int64_t mem_read(void *vctx, void *buf, int64_t off, int64_t len) {
 
 static void mem_close(void *vctx) { free(vctx); }
 
-static const imap_io_backend MEM_BE = { "mem", mem_read, mem_close };
+static const lmap_io_backend MEM_BE = { "mem", mem_read, mem_close };
 
-imap_io *imap_io_open_mem(const void *data, int64_t len) {
+lmap_io *lmap_io_open_mem(const void *data, int64_t len) {
     mem_ctx *c = (mem_ctx *)malloc(sizeof *c);
-    imap_io *io = (imap_io *)calloc(1, sizeof *io);
+    lmap_io *io = (lmap_io *)calloc(1, sizeof *io);
     if (!c || !io) { free(c); free(io); return NULL; }
     c->p = (const uint8_t *)data; c->n = len;
     io->be = &MEM_BE; io->ctx = c; io->base = 0; io->len = len;
@@ -85,11 +85,11 @@ imap_io *imap_io_open_mem(const void *data, int64_t len) {
 
 /* ----------------------------------------------------------------- slice */
 
-imap_io *imap_io_slice(imap_io *parent, int64_t base, int64_t len) {
+lmap_io *lmap_io_slice(lmap_io *parent, int64_t base, int64_t len) {
     /* base+len would be signed overflow (UB) for large inputs; compare by subtraction. */
     if (!parent || base < 0 || len < 0) return NULL;
     if (base > parent->len || len > parent->len - base) return NULL;
-    imap_io *io = (imap_io *)calloc(1, sizeof *io);
+    lmap_io *io = (lmap_io *)calloc(1, sizeof *io);
     if (!io) return NULL;
     io->be = parent->be; io->ctx = parent->ctx;
     io->base = parent->base + base; io->len = len;
@@ -99,7 +99,7 @@ imap_io *imap_io_slice(imap_io *parent, int64_t base, int64_t len) {
 
 /* ------------------------------------------------------------------- api */
 
-int imap_pread(imap_io *io, void *buf, int64_t off, int64_t len) {
+int lmap_pread(lmap_io *io, void *buf, int64_t off, int64_t len) {
     if (!io || off < 0 || len < 0) return -1;
     if (off > io->len || len > io->len - off) return -1;   /* no overflow: both >= 0 */
     if (len == 0) return 0;
@@ -107,9 +107,9 @@ int imap_pread(imap_io *io, void *buf, int64_t off, int64_t len) {
     return (n == len) ? 0 : -1;
 }
 
-int64_t imap_io_size(const imap_io *io) { return io ? io->len : -1; }
+int64_t lmap_io_size(const lmap_io *io) { return io ? io->len : -1; }
 
-void imap_io_close(imap_io *io) {
+void lmap_io_close(lmap_io *io) {
     if (!io) return;
     if (!io->parent && io->be->close) io->be->close(io->ctx);   /* slices borrow */
     free(io);

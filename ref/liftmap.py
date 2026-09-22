@@ -1,4 +1,4 @@
-"""Reference implementation of the imap run codec and chunking (draft 0.1).
+"""Reference implementation of the liftmap run codec and chunking (draft 0.1).
 
 Deliberately literal and slow: it follows doc/SPEC.md line by line so that any divergence
 between the spec text and working code is visible. It is the thing the C library must agree

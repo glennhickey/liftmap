@@ -1,11 +1,11 @@
-"""Mutate an .imap, then repair every CRC so the mutant is structurally valid but
+"""Mutate an .lmap, then repair every CRC so the mutant is structurally valid but
 semantically hostile, and feed it to a reader built with -fsanitize=address,undefined.
 
 Without the CRC repair this finds nothing: the integrity checks reject ~100% of random
 mutations before the parsers ever run. With it, ~45% of mutants open and exercise the
 directory and chunk decode paths.
 
-usage: crcfuzz.py file.imap iters [seed] [all|tail]
+usage: crcfuzz.py file.lmap iters [seed] [all|tail]
 expects ./pocrun: tests/fuzz_reader.c built with -fsanitize=address,undefined.
 """
 import struct, zlib, random, subprocess, sys, os
@@ -58,8 +58,8 @@ for it in range(iters):
         pos=rnd.randrange(lo,hi); b[pos]=rnd.randrange(256)
     fixed=repair(bytes(b))
     if fixed is None: continue
-    open('/tmp/m.imap','wb').write(fixed)
-    r=subprocess.run(['./pocrun','/tmp/m.imap'],capture_output=True,text=True,
+    open('/tmp/m.lmap','wb').write(fixed)
+    r=subprocess.run(['./pocrun','/tmp/m.lmap'],capture_output=True,text=True,
                      env={**os.environ,'ASAN_OPTIONS':'detect_leaks=1'})
     out=(r.stdout or '')+(r.stderr or '')
     if 'opened' in out: opened+=1
@@ -67,6 +67,6 @@ for it in range(iters):
         crashes+=1
         print(f"  !! iter {it} rc={r.returncode}")
         print('   '+'\n   '.join(out.strip().splitlines()[:12]))
-        open(f'/tmp/crash_{seed}_{it}.imap','wb').write(fixed)
+        open(f'/tmp/crash_{seed}_{it}.lmap','wb').write(fixed)
         if crashes>=3: break
 print(f"seed={seed} region={region} iters={iters}: {opened} opened, {crashes} crashes/leaks")

@@ -1,5 +1,5 @@
 /* robust -- position independence and corruption detection. */
-#include "../src/imap_file.h"
+#include "../src/lmap_file.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,14 +18,14 @@ static void reseal(uint8_t *b, long n) {
     b[n-12] = (uint8_t)c; b[n-11] = (uint8_t)(c >> 8); b[n-10] = (uint8_t)(c >> 16); b[n-9] = (uint8_t)(c >> 24);
 }
 static int opens(const uint8_t *buf, long n) {
-    imap_io *io = imap_io_open_mem(buf,n); if(!io) return 0;
-    imap_file *f = imap_open_io(io,0);
-    int ok = f!=NULL; if(f) imap_close(f); imap_io_close(io);
+    lmap_io *io = lmap_io_open_mem(buf,n); if(!io) return 0;
+    lmap_file *f = lmap_open_io(io,0);
+    int ok = f!=NULL; if(f) lmap_close(f); lmap_io_close(io);
     return ok;
 }
 
 int main(int argc,char**argv){
-    if(argc!=2){fprintf(stderr,"usage: robust file.imap\n");return 2;}
+    if(argc!=2){fprintf(stderr,"usage: robust file.lmap\n");return 2;}
     long n; uint8_t *orig=slurp(argv[1],&n);
     if(!orig){perror("slurp");return 2;}
     int fails=0;
@@ -39,15 +39,15 @@ int main(int argc,char**argv){
     for (long pad=1; pad<=100000; pad*=10) {
         uint8_t *big=calloc((size_t)(n+pad+7),1);
         memcpy(big+pad,orig,(size_t)n);
-        imap_io *outer=imap_io_open_mem(big,n+pad+7);
-        imap_io *sl=imap_io_slice(outer,pad,n);
-        imap_file *f= sl? imap_open_io(sl,0):NULL;
-        uint32_t nc = f? imap_n_chunks(f):0;
+        lmap_io *outer=lmap_io_open_mem(big,n+pad+7);
+        lmap_io *sl=lmap_io_slice(outer,pad,n);
+        lmap_file *f= sl? lmap_open_io(sl,0):NULL;
+        uint32_t nc = f? lmap_n_chunks(f):0;
         char lbl[64]; snprintf(lbl,sizeof lbl,"opens at offset %ld inside a larger buffer",pad);
         CHECK(lbl, f!=NULL && nc>0);
-        if(f) imap_close(f);
-        if(sl) imap_io_close(sl);
-        imap_io_close(outer); free(big);
+        if(f) lmap_close(f);
+        if(sl) lmap_io_close(sl);
+        lmap_io_close(outer); free(big);
     }
 
     printf("corruption detection:\n");
@@ -74,29 +74,29 @@ int main(int argc,char**argv){
       CHECK("refuses wrong major version", !opens(c,n)); free(c); }
 
     { /* The payload is not read at open (it scales with the data); each chunk is
-       * checked on read against its directory CRC, and imap_verify checks it all.
+       * checked on read against its directory CRC, and lmap_verify checks it all.
        * The middle byte of a real file lies in the runs section, which dominates. */
       uint8_t *c=malloc((size_t)n); memcpy(c,orig,(size_t)n); c[n/2]^=0x10;
-      imap_io *io = imap_io_open_mem(c,n);
-      imap_file *f = io ? imap_open_io(io,0) : NULL;
+      lmap_io *io = lmap_io_open_mem(c,n);
+      lmap_file *f = io ? lmap_open_io(io,0) : NULL;
       CHECK("a payload bit flip still opens (payload is not read at open)", f != NULL);
-      CHECK("imap_verify reports the payload bit flip", f && imap_verify(f) != 0);
+      CHECK("lmap_verify reports the payload bit flip", f && lmap_verify(f) != 0);
       uint32_t failed = 0;
-      for (uint32_t i = 0; f && i < imap_n_chunks(f); i++) {
-          const imap_chunk *ch = imap_chunk_at(f,i);
-          imap_run *r = malloc((size_t)ch->n_runs * sizeof *r);
-          if (!r || imap_read_chunk(f,i,r) != 0) failed++;
+      for (uint32_t i = 0; f && i < lmap_n_chunks(f); i++) {
+          const lmap_chunk *ch = lmap_chunk_at(f,i);
+          lmap_run *r = malloc((size_t)ch->n_runs * sizeof *r);
+          if (!r || lmap_read_chunk(f,i,r) != 0) failed++;
           free(r);
       }
       CHECK("exactly one chunk refuses to read (its CRC)", failed == 1);
-      if (f) imap_close(f);
-      if (io) imap_io_close(io);
+      if (f) lmap_close(f);
+      if (io) lmap_io_close(io);
       free(c); }
-    { imap_io *io = imap_io_open_mem(orig,n);
-      imap_file *f = io ? imap_open_io(io,0) : NULL;
-      CHECK("imap_verify passes the intact file", f && imap_verify(f) == 0);
-      if (f) imap_close(f);
-      if (io) imap_io_close(io); }
+    { lmap_io *io = lmap_io_open_mem(orig,n);
+      lmap_file *f = io ? lmap_open_io(io,0) : NULL;
+      CHECK("lmap_verify passes the intact file", f && lmap_verify(f) == 0);
+      if (f) lmap_close(f);
+      if (io) lmap_io_close(io); }
 
     free(orig);
     printf("%s (%d failures)\n", fails?"FAILURES":"ALL PASS", fails);

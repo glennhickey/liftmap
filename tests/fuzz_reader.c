@@ -1,22 +1,22 @@
-/* fuzz_reader -- open one .imap and exercise every read path: all chunks (up to a
+/* fuzz_reader -- open one .lmap and exercise every read path: all chunks (up to a
  * cap), and axis-a and axis-b queries of several widths on several members.  Build
  * with -fsanitize=address,undefined and drive it with tests/crcfuzz.py.
  * Exit 1 if any decoded run or query hit violates the format's invariants. */
-#include "../src/imap_file.h"
+#include "../src/lmap_file.h"
 #include <stdio.h>
 #include <stdlib.h>
 
 int main(int argc, char **argv) {
-    if (argc != 2) { fprintf(stderr, "usage: fuzz_reader file.imap\n"); return 2; }
-    imap_file *f = imap_open(argv[1]);
+    if (argc != 2) { fprintf(stderr, "usage: fuzz_reader file.lmap\n"); return 2; }
+    lmap_file *f = lmap_open(argv[1]);
     if (!f) { printf("  REJECTED at open\n"); return 0; }
-    uint32_t nc = imap_n_chunks(f);
+    uint32_t nc = lmap_n_chunks(f);
     long bad = 0, decoded = 0, hits = 0;
     for (uint32_t i = 0; i < nc && i < 200; i++) {
-        const imap_chunk *c = imap_chunk_at(f, i);
+        const lmap_chunk *c = lmap_chunk_at(f, i);
         if (!c || c->n_runs == 0 || c->n_runs > 5000000u) continue;
-        imap_run *r = malloc((size_t)c->n_runs * sizeof *r);
-        if (r && imap_read_chunk(f, i, r) == 0) {
+        lmap_run *r = malloc((size_t)c->n_runs * sizeof *r);
+        if (r && lmap_read_chunk(f, i, r) == 0) {
             decoded++;
             for (uint32_t k = 0; k < c->n_runs; k++)
                 if (r[k].len < 1 || r[k].a < 0 || r[k].b < 0) bad++;
@@ -25,15 +25,15 @@ int main(int argc, char **argv) {
     }
     const int64_t widths[] = { 1, 1000, 1000000, 100000000 };
     for (int ax = 0; ax < 2; ax++) {
-        uint32_t nm = imap_n_members(f, ax);
+        uint32_t nm = lmap_n_members(f, ax);
         for (uint32_t m = 0; m < nm && m < 8; m++) {
-            const imap_member *mem = imap_member_at(f, ax, m);
+            const lmap_member *mem = lmap_member_at(f, ax, m);
             int64_t mid = (int64_t)((mem->axis_min + mem->axis_max) / 2);
             for (int w = 0; w < 4; w++) {
-                imap_hit *h; size_t n;
+                lmap_hit *h; size_t n;
                 int64_t lo = mid - widths[w] < 0 ? 0 : mid - widths[w];
-                int rc = ax ? imap_query_b(f, m, lo, mid + widths[w], &h, &n, NULL)
-                            : imap_query_a(f, m, lo, mid + widths[w], &h, &n, NULL);
+                int rc = ax ? lmap_query_b(f, m, lo, mid + widths[w], &h, &n, NULL)
+                            : lmap_query_a(f, m, lo, mid + widths[w], &h, &n, NULL);
                 if (rc != 0) continue;
                 for (size_t k = 0; k < n; k++) {
                     if (h[k].len < 1 || h[k].a < 0 || h[k].b < 0) bad++;
@@ -46,7 +46,7 @@ int main(int argc, char **argv) {
         }
     }
     printf("  opened: %u chunks, %u/%u members, %ld chunks decoded, %ld hits, %ld invalid\n",
-           nc, imap_n_members(f, 0), imap_n_members(f, 1), decoded, hits, bad);
-    imap_close(f);
+           nc, lmap_n_members(f, 0), lmap_n_members(f, 1), decoded, hits, bad);
+    lmap_close(f);
     return bad ? 1 : 0;
 }

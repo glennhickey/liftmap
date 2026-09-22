@@ -1,6 +1,6 @@
-# `libintervalmap` — format schema (draft 0.1)
+# `liftmap` — format specification
 
-An **interval map** is a set of colinear ungapped *runs* relating intervals on axis **a** to
+A **liftmap** is a set of colinear ungapped *runs* relating intervals on axis **a** to
 intervals on axis **b**, chunked, indexed from both axes, in one self-describing file.
 
 Two profiles are defined here: `hal2.edge` (a child genome onto its parent) and `taffy.tui`
@@ -20,6 +20,10 @@ Design rules this draft is required to honour:
   mean. (This is the thing ONEcode stops short of: its `D R 2 3 INT 6 STRING` declares "an int
   and a blob", which is ~1% of a `.tui`.)
 
+**History.** liftmap began as `libintervalmap` (prefix `imap_`, magic `IMAP`); its format 4
+is liftmap's format 1, renamed. Measurements below that mention `.lmap` files were taken
+under the old name.
+
 ---
 
 ## 1. Schema text
@@ -31,7 +35,7 @@ the writer is wrong.**
 ### 1.1 Directives
 
 ```
-imap <major>                          format version of this document
+liftmap <major>                          format version of this document
 profile <name> <version>              who wrote it and what the axes mean
 
 axis <a|b> <label> coord <seqlocal|global> [extent <n>]
@@ -216,9 +220,9 @@ Little-endian throughout. Sections are 8-byte aligned.
 
 ```
 HEADER  (64 B, at offset 0 — sized so format sniffers that read 64 bytes see all of it)
-  0   u8[8]   magic  = "IMAP\x1A\x0D\x0A\x00"
-  8   u32     imap_major         4; a reader requires an exact match
-  12  u32     imap_minor         0
+  0   u8[8]   magic  = "LMAP\x1A\x0D\x0A\x00"
+  8   u32     lmap_major         1; a reader requires an exact match
+  12  u32     lmap_minor         0
   16  u64     feature_flags      unknown bit set => reader MUST refuse
                                  bit 0: runs within a chunk are in order b
                                  bit 1: A_OVERLAP -- axis a may overlap (1.2);
@@ -250,7 +254,7 @@ Open = `pread` the last 32 B, then `pread` the footer, then the directory sectio
 `runs` section is not read at open**: it is the one section whose size scales with the
 data, and an index is opened to touch a few chunks. Each chunk carries its own CRC in its
 directory entry, checked whenever the chunk is read. The `runs` section's own CRC in the
-section table is checked only by a full verification pass (`imap_verify`, which streams it
+section table is checked only by a full verification pass (`lmap_verify`, which streams it
 in bounded reads). An earlier version read and checksummed the whole payload at open, which
 cost 175 ms per open on the 228 MB rodent index; opening now takes 7 ms.
 
@@ -454,7 +458,7 @@ query: axis a 1.00 at a 2 bp window, 3.0 at 200 kb; axis b 1.35 at 2 bp, 2.3 at 
 ### 3.1 `hal2.edge` — a child genome onto its parent
 
 ```
-imap 1
+liftmap 1
 profile hal2.edge 1
 
 axis  a  child   coord seqlocal
@@ -488,7 +492,7 @@ duplicated positions, zero differences.
 ### 3.2 `taffy.tui` — a genome onto the universal column axis
 
 ```
-imap 1
+liftmap 1
 profile taffy.tui 3
 
 axis  a  genome  coord seqlocal
@@ -546,7 +550,7 @@ this data in earlier runs, so ~1.93–1.97 B/run is the expected figure.
 
 Per-field round-trip (a, b, len, strand) was checked on every 97th chunk: 0 mismatches.
 
-**Validated against taffy's `.tui` reader** (`tests/imap_transcode.c` in the taffy
+**Validated against taffy's `.tui` reader** (`tests/lmap_transcode.c` in the taffy
 checkout, up to commit 09ced8e; retired once `.tui` itself moved onto this library, below). Every run of `tests/tui/evolverMammals.uni.maf.gz.tui` (16 sequences, 123,471
 runs, T = 708,019 columns) was read with tui's own reader and written through this library:
 
@@ -565,7 +569,7 @@ same three checks at zero mismatches. With per-stream compression it is **263,49
 The same check on the rodent universal index (`vgp-577way-v1-MuridaeAnc3`, regenerated in
 tui format 0.3: 11,698 sequences, 84,970,744 runs, T = 2,731,506,489 columns):
 
-| | `.tui` | `.imap`, order b |
+| | `.tui` | `.lmap`, order b |
 |---|---|---|
 | size | 235,525,448 bytes | **226,116,332 bytes (−4.0%)** |
 | forward lift, 11,243 whole sequences (1.22 × 10^9 bases) | 0.361 s | 0.050 s |
@@ -579,7 +583,7 @@ Run identity, forward lift and reverse lift all agree exactly. Transcoding took 
 And on the fish-subtree universal index (`vgp-577way-v1.RayFinnedFishesAnc64`, regenerated
 in tui format 0.3: 57 genomes, 120,805 sequences, 846,503,338 runs, T = 2,655,269,561):
 
-| | `.tui` | `.imap`, order b |
+| | `.tui` | `.lmap`, order b |
 |---|---|---|
 | chunks | 354,369 | **354,369** — identical, so the layout matches rather than approximates |
 | size | 1,956,422,670 bytes | **1,911,774,892 bytes (−2.3%)** |
@@ -597,7 +601,7 @@ checked against the ONEcode build of taffy on the same inputs:
 
 | | rodent | fish subtree |
 |---|---|---|
-| `.tui` size, ONEcode → libintervalmap | 235.5 → 227.8 MB | 1,956 → 1,916 MB |
+| `.tui` size, ONEcode → liftmap | 235.5 → 227.8 MB | 1,956 → 1,916 MB |
 | `taffy index -u` wall | 2:46 → 2:40 | 37:50 → 38:11 |
 | open | 7 ms | 72 ms (354,369 chunks, 120,805 sequences) |
 | `view -U`, 30 regions × 3 modes | 90/90 identical, 5.0 → 5.3 s | 90/90 identical, 35.3 → 40.3 s |

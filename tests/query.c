@@ -1,4 +1,4 @@
-/* query -- check imap_query_a / imap_query_b against a brute-force oracle.
+/* query -- check lmap_query_a / lmap_query_b against a brute-force oracle.
  *
  * in: binary {int64 a; int64 b; int64 len; int64 strand; int32 amem; int32 bmem} x N,
  *     grouped by amem with a increasing within a member.
@@ -6,7 +6,7 @@
  * arrives in id order and the writer's dir.a sort is exercised.
  * The oracle maps a window to the other axis via the explicit base pairing
  * pair(i) = strand ? other+len-1-i : other+i, not via the library's clip formula. */
-#include "../src/imap_file.h"
+#include "../src/lmap_file.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,17 +14,17 @@
 typedef struct { int64_t a,b,len,strand; int32_t am,bm; } inrec;
 
 static int cmp_a(const void *x, const void *y) {
-    const imap_hit *p=x,*q=y; return (p->a>q->a)-(p->a<q->a);
+    const lmap_hit *p=x,*q=y; return (p->a>q->a)-(p->a<q->a);
 }
 static int cmp_b(const void *x, const void *y) {
-    const imap_hit *p=x,*q=y;
+    const lmap_hit *p=x,*q=y;
     if (p->b!=q->b) return (p->b>q->b)-(p->b<q->b);
     if (p->a_member!=q->a_member) return (p->a_member>q->a_member)-(p->a_member<q->a_member);
     return (p->a>q->a)-(p->a<q->a);
 }
 
 /* oracle clip, derived independently of the library */
-static int oracle(const inrec *r, int axis, int64_t lo, int64_t hi, imap_hit *h) {
+static int oracle(const inrec *r, int axis, int64_t lo, int64_t hi, lmap_hit *h) {
     int64_t s0 = axis ? r->b : r->a, o0 = axis ? r->a : r->b;
     int64_t s = s0 > lo ? s0 : lo, e = s0 + r->len < hi ? s0 + r->len : hi;
     if (s >= e) return 0;
@@ -42,8 +42,8 @@ static uint64_t rng = 88172645463325252ULL;
 static uint64_t xr(void) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; }
 
 int main(int argc, char **argv) {
-    if (argc != 4 && argc != 5) { fprintf(stderr,"usage: query runs.bin out.imap nqueries [a|b]\n"); return 2; }
-    int order = (argc == 5 && argv[4][0] == 'b') ? IMAP_ORDER_B : IMAP_ORDER_A;
+    if (argc != 4 && argc != 5) { fprintf(stderr,"usage: query runs.bin out.lmap nqueries [a|b]\n"); return 2; }
+    int order = (argc == 5 && argv[4][0] == 'b') ? LMAP_ORDER_B : LMAP_ORDER_A;
     FILE *fp = fopen(argv[1],"rb"); if (!fp) { perror("runs"); return 2; }
     fseek(fp,0,SEEK_END); long sz=ftell(fp); fseek(fp,0,SEEK_SET);
     long n = sz/(long)sizeof(inrec);
@@ -54,18 +54,18 @@ int main(int argc, char **argv) {
     for (long i=0;i<n;i++){ if(r[i].am+1>na) na=r[i].am+1; if(r[i].bm+1>nb) nb=r[i].bm+1; }
     for (long i=0;i<n;i++) r[i].am = na-1-r[i].am;          /* remap: ids no longer in input order */
 
-    imap_writer *w = imap_writer_open(argv[2],"hal2.edge","imap 1\n");
-    if (imap_writer_set_order(w, order) != 0) { fprintf(stderr,"set_order failed\n"); return 1; }
+    lmap_writer *w = lmap_writer_open(argv[2],"hal2.edge","liftmap 1\n");
+    if (lmap_writer_set_order(w, order) != 0) { fprintf(stderr,"set_order failed\n"); return 1; }
     char nm[64];
-    for (int32_t i=0;i<na;i++){ snprintf(nm,sizeof nm,"a%d",i); imap_writer_add_member(w,0,nm,1ULL<<40); }
-    for (int32_t i=0;i<nb;i++){ snprintf(nm,sizeof nm,"b%d",i); imap_writer_add_member(w,1,nm,1ULL<<40); }
+    for (int32_t i=0;i<na;i++){ snprintf(nm,sizeof nm,"a%d",i); lmap_writer_add_member(w,0,nm,1ULL<<40); }
+    for (int32_t i=0;i<nb;i++){ snprintf(nm,sizeof nm,"b%d",i); lmap_writer_add_member(w,1,nm,1ULL<<40); }
     for (long i=0;i<n;i++)
-        if (imap_writer_add_run(w,(uint32_t)r[i].am,(uint32_t)r[i].bm,r[i].a,r[i].b,r[i].len,(uint8_t)r[i].strand)) {
+        if (lmap_writer_add_run(w,(uint32_t)r[i].am,(uint32_t)r[i].bm,r[i].a,r[i].b,r[i].len,(uint8_t)r[i].strand)) {
             fprintf(stderr,"add_run %ld failed\n",i); return 1; }
-    if (imap_writer_close(w)) { fprintf(stderr,"close failed\n"); return 1; }
-    imap_file *f = imap_open(argv[2]);
+    if (lmap_writer_close(w)) { fprintf(stderr,"close failed\n"); return 1; }
+    lmap_file *f = lmap_open(argv[2]);
     if (!f) { fprintf(stderr,"open failed (invariant check?)\n"); return 1; }
-    if (imap_order(f) != order) { fprintf(stderr,"order not round-tripped\n"); return 1; }
+    if (lmap_order(f) != order) { fprintf(stderr,"order not round-tripped\n"); return 1; }
 
     /* index input runs by member on each axis, for the oracle */
     long *ca = calloc((size_t)na+1,sizeof *ca), *cb = calloc((size_t)nb+1,sizeof *cb);
@@ -81,7 +81,7 @@ int main(int argc, char **argv) {
     long nq = atol(argv[3]), fails = 0, total_hits = 0;
     double dec_sum[2][5] = {{0}}; long dec_n[2][5] = {{0}};
     long expcap = 1L << 20;
-    imap_hit *exp = malloc((size_t)expcap * sizeof *exp);
+    lmap_hit *exp = malloc((size_t)expcap * sizeof *exp);
 
     for (long q=0; q<nq; q++) {
         long i = (long)(xr() % (uint64_t)n);
@@ -102,8 +102,8 @@ int main(int argc, char **argv) {
         }
         qsort(exp, (size_t)ne, sizeof *exp, axis ? cmp_b : cmp_a);
 
-        imap_hit *got; size_t ng; imap_query_stats st;
-        int rc = axis ? imap_query_b(f,m,lo,hi,&got,&ng,&st) : imap_query_a(f,m,lo,hi,&got,&ng,&st);
+        lmap_hit *got; size_t ng; lmap_query_stats st;
+        int rc = axis ? lmap_query_b(f,m,lo,hi,&got,&ng,&st) : lmap_query_a(f,m,lo,hi,&got,&ng,&st);
         int ok = rc == 0 && (long)ng == ne;
         for (long k = 0; ok && k < ne; k++)
             ok = got[k].a==exp[k].a && got[k].b==exp[k].b && got[k].len==exp[k].len &&
@@ -126,7 +126,7 @@ int main(int argc, char **argv) {
         for (int k=0;k<NW;k++) printf("%10.2f", dec_n[ax][k] ? dec_sum[ax][k]/dec_n[ax][k] : 0);
     }
     printf("\n");
-    imap_close(f);
+    lmap_close(f);
     free(exp); free(ia); free(ib); free(fa); free(fb); free(ca); free(cb); free(r);
     return fails ? 1 : 0;
 }
