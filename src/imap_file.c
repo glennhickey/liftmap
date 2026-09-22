@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <zlib.h>
 
 /* ------------------------------------------- little-endian load/store helpers
@@ -21,6 +22,19 @@ static uint32_t ld32(const uint8_t *p) {
 }
 static uint64_t ld64(const uint8_t *p) {
     return (uint64_t)ld32(p) | ((uint64_t)ld32(p+4) << 32);
+}
+
+/* zlib's crc32 takes a uInt (32-bit), so a single call silently checksums only
+ * len mod 2^32 bytes.  Feed it in bounded steps instead. */
+static uint32_t crc_all(const uint8_t *p, uint64_t n) {
+    uLong c = crc32(0L, Z_NULL, 0);
+    while (n) {
+        uInt k = n > 0x40000000u ? 0x40000000u : (uInt)n;
+        c = crc32(c, p ? p : (const Bytef *)"", k);
+        if (p) p += k;
+        n -= k;
+    }
+    return (uint32_t)c;
 }
 
 /* growable byte vector */
@@ -78,6 +92,7 @@ imap_writer *imap_writer_open(const char *path, const char *profile, const char 
 int imap_writer_set_params(imap_writer *w, uint32_t count, uint64_t bspan, int codec) {
     if (!w || w->n_chunks || w->n_pend) return -1;      /* only before any run */
     if (count == 0) return -1;
+    if (codec != IMAP_CODEC_NONE && codec != IMAP_CODEC_ZLIB) return -1;
     w->count = count; w->bspan = bspan; w->codec = codec; return 0;
 }
 
@@ -128,13 +143,18 @@ static int flush_chunk(imap_writer *w) {
         if (!c) { free(z); vec_free(&blob); return -1; }
         w->chunks = c; w->cap_chunks = cap;
     }
+    uint64_t a_span64 = (uint64_t)(w->pend[w->n_pend-1].a + w->pend[w->n_pend-1].len)
+                        - (uint64_t)w->pend[0].a;
+    uint64_t b_span64 = w->pend_bmax - w->pend_bmin;
+    if (a_span64 > 0xFFFFFFFFull || b_span64 > 0xFFFFFFFFull) { free(z); vec_free(&blob); return -1; }
+
     imap_chunk *c = &w->chunks[w->n_chunks];
     memset(c, 0, sizeof *c);
     c->a_member = w->pend_amem; c->b_member = w->pend_bmem;
     c->a_min = (uint64_t)w->pend[0].a;
-    c->a_span = (uint32_t)((w->pend[w->n_pend-1].a + w->pend[w->n_pend-1].len) - w->pend[0].a);
+    c->a_span = (uint32_t)a_span64;
     c->b_min = w->pend_bmin;
-    c->b_span = (uint32_t)(w->pend_bmax - w->pend_bmin);
+    c->b_span = (uint32_t)b_span64;
     c->b_enter0 = (uint64_t)imap_b_enter(w->pend[0].b, w->pend[0].len, w->pend[0].strand);
     c->off = w->runs.n;
     c->clen = (uint32_t)bodylen;
@@ -174,10 +194,16 @@ int imap_writer_add_run(imap_writer *w, uint32_t a_member, uint32_t b_member,
         if (nlo > w->pend_bmin) nlo = w->pend_bmin;
         if (nhi < w->pend_bmax) nhi = w->pend_bmax;
     }
+    /* a_span and b_span are u32 on disk (SPEC 2.2).  A chunk whose extent would not
+     * fit is closed early rather than silently wrapping, because a loose or wrapped
+     * extent makes every reverse-lookup skip wrong. */
+    uint64_t na_end = (uint64_t)(a + len);
+    uint64_t na_span = w->n_pend ? na_end - (uint64_t)w->pend[0].a : (uint64_t)len;
     int cut = w->n_pend &&
               (w->n_pend >= w->count ||
                a_member != w->pend_amem || b_member != w->pend_bmem ||
-               (w->bspan && (nhi - nlo) > w->bspan));
+               (w->bspan && (nhi - nlo) > w->bspan) ||
+               na_span > 0xFFFFFFFFull || (nhi - nlo) > 0xFFFFFFFFull);
     if (cut) { if (flush_chunk(w) != 0) { w->failed = 1; return -1; } }
 
     if (w->n_pend == 0) {
@@ -201,11 +227,13 @@ int imap_writer_add_run(imap_writer *w, uint32_t a_member, uint32_t b_member,
     return 0;
 }
 
-/* name-sorted permutation over a member array */
-static wmember *g_sortbase;
+/* name-sorted permutation over a member array.  The key travels with the element
+ * rather than through a global, so two writers can run concurrently. */
+typedef struct { const char *name; uint32_t id; } namekey;
 static int cmp_by_name(const void *x, const void *y) {
-    uint32_t i = *(const uint32_t *)x, j = *(const uint32_t *)y;
-    return strcmp(g_sortbase[i].name, g_sortbase[j].name);
+    const namekey *a = (const namekey *)x, *b = (const namekey *)y;
+    int c = strcmp(a->name, b->name);
+    return c ? c : (a->id < b->id ? -1 : a->id > b->id);
 }
 
 static int build_memdir(imap_writer *w, int axis, vec *out) {
@@ -213,15 +241,14 @@ static int build_memdir(imap_writer *w, int axis, vec *out) {
     vec names = {0};
     uint32_t *noff = calloc(n ? n : 1, sizeof *noff);
     uint32_t *nlen = calloc(n ? n : 1, sizeof *nlen);
-    uint32_t *perm = malloc((n ? n : 1) * sizeof *perm);
+    namekey *perm = malloc((n ? n : 1) * sizeof *perm);
     if (!noff || !nlen || !perm) { free(noff); free(nlen); free(perm); return -1; }
     for (uint32_t i = 0; i < n; i++) {
         size_t L = strlen(w->mem[axis][i].name);
         noff[i] = (uint32_t)names.n; nlen[i] = (uint32_t)L;
         if (vec_put(&names, w->mem[axis][i].name, L) != 0) goto fail;
-        perm[i] = i;
+        perm[i].name = w->mem[axis][i].name; perm[i].id = i;
     }
-    g_sortbase = w->mem[axis];
     qsort(perm, n, sizeof *perm, cmp_by_name);
 
     if (vec_put32(out, n) != 0) goto fail;
@@ -234,7 +261,7 @@ static int build_memdir(imap_writer *w, int axis, vec *out) {
             vec_put32(out, m->first_chunk) || vec_put32(out, m->n_chunks)) goto fail;
     }
     if (vec_put(out, names.p, names.n) != 0) goto fail;
-    for (uint32_t i = 0; i < n; i++) if (vec_put32(out, perm[i]) != 0) goto fail;
+    for (uint32_t i = 0; i < n; i++) if (vec_put32(out, perm[i].id) != 0) goto fail;
     vec_free(&names); free(noff); free(nlen); free(perm);
     return 0;
 fail:
@@ -244,12 +271,12 @@ fail:
 
 /* dir.b: chunk ids ordered by (b_member, b_min), each with the running max of
  * b_min+b_span, so a reverse walk can stop early. */
-static imap_chunk *g_cbase;
+typedef struct { uint32_t b_member; uint64_t b_min; uint32_t id; } bkey;
 static int cmp_by_b(const void *x, const void *y) {
-    const imap_chunk *p = &g_cbase[*(const uint32_t *)x], *q = &g_cbase[*(const uint32_t *)y];
+    const bkey *p = (const bkey *)x, *q = (const bkey *)y;
     if (p->b_member != q->b_member) return p->b_member < q->b_member ? -1 : 1;
     if (p->b_min != q->b_min) return p->b_min < q->b_min ? -1 : 1;
-    return 0;
+    return p->id < q->id ? -1 : p->id > q->id;
 }
 
 static int write_all(FILE *fp, const void *p, size_t n) {
@@ -273,18 +300,21 @@ int imap_writer_close(imap_writer *w) {
             vec_put32(&dira, c->n_runs) || vec_put32(&dira, c->codec)) goto done;
     }
     {
-        uint32_t *perm = malloc((w->n_chunks ? w->n_chunks : 1) * sizeof *perm);
+        bkey *perm = malloc((w->n_chunks ? w->n_chunks : 1) * sizeof *perm);
         if (!perm) goto done;
-        for (uint32_t i = 0; i < w->n_chunks; i++) perm[i] = i;
-        g_cbase = w->chunks;
+        for (uint32_t i = 0; i < w->n_chunks; i++) {
+            perm[i].b_member = w->chunks[i].b_member;
+            perm[i].b_min = w->chunks[i].b_min;
+            perm[i].id = i;
+        }
         qsort(perm, w->n_chunks, sizeof *perm, cmp_by_b);
         uint64_t run_max = 0;
         int bad = 0;
         for (uint32_t i = 0; i < w->n_chunks; i++) {
-            imap_chunk *c = &w->chunks[perm[i]];
+            imap_chunk *c = &w->chunks[perm[i].id];
             uint64_t end = c->b_min + c->b_span;
             if (i == 0 || end > run_max) run_max = end;
-            bad |= vec_put32(&dirb, perm[i]);
+            bad |= vec_put32(&dirb, perm[i].id);
             bad |= vec_put64(&dirb, run_max);
         }
         free(perm);
@@ -322,7 +352,7 @@ int imap_writer_close(imap_writer *w) {
         if (write_all(w->fp, pad, padn) != 0) goto done;
         cur += padn;
         off[i] = cur; len[i] = sec[i].n;
-        crc[i] = (uint64_t)crc32(crc32(0L, Z_NULL, 0), sec[i].p ? sec[i].p : (const Bytef *)"", (uInt)sec[i].n);
+        crc[i] = crc_all(sec[i].p, (uint64_t)sec[i].n);
         if (write_all(w->fp, sec[i].p, sec[i].n) != 0) goto done;
         cur += sec[i].n;
     }
@@ -351,7 +381,7 @@ int imap_writer_close(imap_writer *w) {
         memset(tr, 0, sizeof tr);
         st64(tr, foot_off);
         st64(tr + 8, (uint64_t)foot.n);
-        st32(tr + 16, (uint32_t)crc32(crc32(0L, Z_NULL, 0), foot.p, (uInt)foot.n));
+        st32(tr + 16, crc_all(foot.p, (uint64_t)foot.n));
         memcpy(tr + 24, IMAP_MAGIC, 8);
         if (write_all(w->fp, tr, sizeof tr) != 0) goto done;
     }
@@ -360,6 +390,7 @@ int imap_writer_close(imap_writer *w) {
 done:
     vec_free(&foot); vec_free(&dira); vec_free(&dirb); vec_free(&ma); vec_free(&mb);
     if (w->fp) { if (fclose(w->fp) != 0) rc = -1; w->fp = NULL; }
+    if (rc != 0 && w->path) remove(w->path);   /* no half-written file left behind */
     imap_writer_abort(w);
     return rc;
 }
@@ -400,18 +431,21 @@ static int read_section_body(imap_io *io, uint64_t off, uint64_t len, uint8_t **
 static int parse_memdir(imap_file *f, int axis, const uint8_t *p, size_t n) {
     if (n < 8) return -1;
     uint32_t cnt = ld32(p), blob = ld32(p + 4);
-    size_t need = 8 + (size_t)cnt * IMAP_MEM_ENTRY + blob + (size_t)cnt * 4;
-    if (need > n) return -1;
+    /* 64-bit throughout: on ILP32 a size_t product here wraps, and cnt/blob are
+     * both read straight off disk. */
+    uint64_t need = 8ull + (uint64_t)cnt * IMAP_MEM_ENTRY + (uint64_t)blob + (uint64_t)cnt * 4ull;
+    if (need > (uint64_t)n) return -1;
     const uint8_t *e = p + 8;
     const uint8_t *names = e + (size_t)cnt * IMAP_MEM_ENTRY;
     f->mem[axis] = calloc(cnt ? cnt : 1, sizeof *f->mem[axis]);
     f->by_name[axis] = calloc(cnt ? cnt : 1, sizeof **f->by_name);
     if (!f->mem[axis] || !f->by_name[axis]) return -1;
+    f->n_mem[axis] = cnt;   /* set first: imap_close must free whatever we allocated */
     for (uint32_t i = 0; i < cnt; i++, e += IMAP_MEM_ENTRY) {
         uint32_t noff = ld32(e), nlen = ld32(e + 4);
-        if ((size_t)noff + nlen > blob) return -1;
+        if ((uint64_t)noff + (uint64_t)nlen > (uint64_t)blob) return -1;
         imap_member *m = &f->mem[axis][i];
-        m->name = malloc(nlen + 1u);
+        m->name = malloc((size_t)nlen + 1);     /* nlen+1u wraps to 0 at UINT32_MAX */
         if (!m->name) return -1;
         memcpy(m->name, names + noff, nlen); m->name[nlen] = 0;
         m->length   = ld64(e + 8);
@@ -426,7 +460,6 @@ static int parse_memdir(imap_file *f, int axis, const uint8_t *p, size_t n) {
         if (id >= cnt) return -1;
         f->by_name[axis][i] = id;
     }
-    f->n_mem[axis] = cnt;
     return 0;
 }
 
@@ -451,14 +484,18 @@ imap_file *imap_open_io(imap_io *io, int own_io) {
 
     uint8_t *foot = NULL;
     if (read_section_body(io, foff, flen, &foot) != 0) goto fail;
-    if ((uint32_t)crc32(crc32(0L, Z_NULL, 0), foot, (uInt)flen) != ld32(tr + 16)) { free(foot); goto fail; }
+    if (crc_all(foot, flen) != ld32(tr + 16)) { free(foot); goto fail; }
 
     /* section table */
     const uint8_t *p = foot, *end = foot + flen;
     if (end - p < 4) { free(foot); goto fail; }
     uint32_t nsec = ld32(p); p += 4;
+    /* Smallest possible entry is 1 id byte + 8 + 8 + 8 + 1 + 1 + 4 = 31 bytes.
+     * Reject an inflated count before allocating anything for it. */
+    if ((uint64_t)nsec * 31ull > flen) goto footfail;
     uint8_t *dira = NULL, *dirb = NULL, *ma = NULL, *mb = NULL;
     uint64_t dira_n = 0, dirb_n = 0, ma_n = 0, mb_n = 0;
+    int seen_runs = 0;
     for (uint32_t i = 0; i < nsec; i++) {
         if (end - p < 1) goto footfail;
         uint8_t idlen = *p++;
@@ -466,29 +503,43 @@ imap_file *imap_open_io(imap_io *io, int own_io) {
         char id[256]; memcpy(id, p, idlen); id[idlen] = 0; p += idlen;
         uint64_t so = ld64(p); p += 8;
         uint64_t sl = ld64(p); p += 8;
-        p += 8;                                  /* raw_len (== sl while uncompressed) */
-        p += 2;                                  /* codec, flags */
+        uint64_t sraw = ld64(p); p += 8;
+        uint8_t scodec = *p++; uint8_t sflags = *p++;
         uint32_t scrc = ld32(p); p += 4;
         if (so > (uint64_t)sz || sl > (uint64_t)sz - so) goto footfail;
+        if (scodec != IMAP_CODEC_NONE || sflags != 0 || sraw != sl) goto footfail;
 
         uint8_t **dst = NULL; uint64_t *dstn = NULL;
         if      (!strcmp(id, "dir.a")) { dst = &dira; dstn = &dira_n; }
         else if (!strcmp(id, "dir.b")) { dst = &dirb; dstn = &dirb_n; }
         else if (!strcmp(id, "mem.a")) { dst = &ma;   dstn = &ma_n;   }
         else if (!strcmp(id, "mem.b")) { dst = &mb;   dstn = &mb_n;   }
-        else if (!strcmp(id, "runs"))  { f->runs_off = so; f->runs_len = sl; continue; }
+        else if (!strcmp(id, "runs")) {
+            if (seen_runs) goto footfail;         /* duplicate ids are not legal */
+            seen_runs = 1;
+            uint8_t *body = NULL;                 /* verify the payload's checksum too */
+            if (read_section_body(io, so, sl, &body) != 0) goto footfail;
+            int bad = (crc_all(body, sl) != scrc);
+            free(body);
+            if (bad) goto footfail;
+            f->runs_off = so; f->runs_len = sl;
+            continue;
+        }
         else if (!strcmp(id, "schema")) {
-            uint8_t *s = NULL;
-            if (read_section_body(io, so, sl, &s) != 0) goto footfail;
+            if (f->schema) goto footfail;
+            uint8_t *sb = NULL;
+            if (read_section_body(io, so, sl, &sb) != 0) goto footfail;
+            if (crc_all(sb, sl) != scrc) { free(sb); goto footfail; }
             f->schema = malloc((size_t)sl + 1);
-            if (!f->schema) { free(s); goto footfail; }
-            memcpy(f->schema, s, (size_t)sl); f->schema[sl] = 0; free(s);
+            if (!f->schema) { free(sb); goto footfail; }
+            memcpy(f->schema, sb, (size_t)sl); f->schema[sl] = 0; free(sb);
             continue;
         } else continue;                          /* unknown section: skip, not an error */
 
+        if (*dst) goto footfail;                  /* duplicate id: would leak the first */
         if (read_section_body(io, so, sl, dst) != 0) goto footfail;
         *dstn = sl;
-        if ((uint32_t)crc32(crc32(0L, Z_NULL, 0), *dst, (uInt)sl) != scrc) goto footfail;
+        if (crc_all(*dst, sl) != scrc) goto footfail;
     }
     free(foot); foot = NULL;
 
@@ -507,6 +558,8 @@ imap_file *imap_open_io(imap_io *io, int own_io) {
         c->n_runs   = ld32(e + 56); c->codec = ld32(e + 60);
         if (c->codec != IMAP_CODEC_NONE && c->codec != IMAP_CODEC_ZLIB) goto tablefail;
         if (c->off > f->runs_len || c->clen > f->runs_len - c->off) goto tablefail;
+        /* a_min and b_enter0 are decode bases handed to imap_decode_chunk as int64. */
+        if (c->a_min > (uint64_t)INT64_MAX || c->b_enter0 > (uint64_t)INT64_MAX) goto tablefail;
     }
     if (dirb && dirb_n == (uint64_t)f->n_chunks * IMAP_DIRB_ENTRY) {
         f->dirb_id  = malloc((f->n_chunks ? f->n_chunks : 1) * sizeof *f->dirb_id);
@@ -521,6 +574,18 @@ imap_file *imap_open_io(imap_io *io, int own_io) {
     }
     if (ma && parse_memdir(f, 0, ma, (size_t)ma_n) != 0) goto tablefail;
     if (mb && parse_memdir(f, 1, mb, (size_t)mb_n) != 0) goto tablefail;
+    /* Every member id we hand to a caller must actually name a member. */
+    for (uint32_t i = 0; i < f->n_chunks; i++) {
+        if (f->chunks[i].a_member >= f->n_mem[0] ||
+            f->chunks[i].b_member >= f->n_mem[1]) goto tablefail;
+    }
+    for (int ax = 0; ax < 2; ax++) {
+        for (uint32_t i = 0; i < f->n_mem[ax]; i++) {
+            imap_member *m = &f->mem[ax][i];
+            if (m->n_chunks > f->n_chunks ||
+                m->first_chunk > f->n_chunks - m->n_chunks) goto tablefail;
+        }
+    }
     free(dira); free(dirb); free(ma); free(mb);
     return f;
 
@@ -529,17 +594,14 @@ footfail:
 tablefail:
     free(dira); free(dirb); free(ma); free(mb);
 fail:
-    f->own_io = 0;
-    imap_close(f);
+    imap_close(f);      /* honours own_io, so a failed imap_open_io(io,1) frees io */
     return NULL;
 }
 
 imap_file *imap_open(const char *path) {
     imap_io *io = imap_io_open_file(path);
     if (!io) return NULL;
-    imap_file *f = imap_open_io(io, 1);
-    if (!f) imap_io_close(io);
-    return f;
+    return imap_open_io(io, 1);   /* takes ownership on success and on failure */
 }
 
 void imap_close(imap_file *f) {

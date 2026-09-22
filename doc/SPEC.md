@@ -146,6 +146,11 @@ genomes with few, long members, where `count` is the only thing closing a chunk.
 `order` is declared, not assumed. `order a` is the default and keeps axis-a deltas
 non-negative; `order b` is what `.tui` does today.
 
+**Implementation status.** The C writer implements `order a` and `seqbound both` only,
+and encodes axis a as `uvarint`; it rejects a chunk whose extent would not fit the u32
+span fields rather than letting one wrap. A file declaring `order b` or
+`field a ... enc zigzag` is legal per this document but is not yet produced or read.
+
 ---
 
 ## 2. Container
@@ -169,7 +174,8 @@ FOOTER  (variable): section table, member directories, chunk directories,
 TRAILER (32 B, last 32 bytes of the file)
   0   u64     footer_off         relative to byte 0
   8   u64     footer_len
-  16  u32     footer_crc32c
+  16  u32     footer_crc32          CRC-32 (IEEE); computed in bounded steps,
+                                 since zlib's uInt truncates a >4 GiB length
   20  u32     reserved (0)
   24  u8[8]   magic (repeated)
 ```
@@ -185,9 +191,9 @@ Open = `pread` the last 32 B, then `pread` the footer. Nothing else is read unti
     u64  off                           relative to byte 0
     u64  len                           bytes on disk
     u64  raw_len                       uncompressed
-    u8   codec                         0 none, 1 zstd, 2 zlib
+    u8   codec                         0 none, 1 zlib  (per-section; see below)
     u8   flags
-    u32  crc32c
+    u32  crc32
 ```
 
 Unknown section ids are skipped, not an error — that plus `feature_flags` is the extension
@@ -197,21 +203,37 @@ scratch; the cost of reserving them now is these two lines.
 
 ### 2.2 Chunk directory `dir.a` — fixed width, uncompressed, binary-searchable
 
-48 bytes per chunk, sorted by `(a_member, a_min)`:
+**64 bytes** per chunk, sorted by `(a_member, a_min)`, little-endian, in this order:
 
 ```
-  u32 a_member      u64 a_min   u32 a_span
-  u32 b_member      u64 b_min   u32 b_span
-  u64 off           u32 len     u32 n_runs      off relative to the `runs` section
+   0  u32 a_member       4  u32 b_member
+   8  u64 a_min         16  u32 a_span     20  u32 b_span
+  24  u64 b_min
+  32  u64 b_enter0      <- the first run's axis-b entry point; a decode base
+  40  u64 off           <- relative to the start of the `runs` section
+  48  u32 clen          52  u32 rawlen     56  u32 n_runs     60  u32 codec
 ```
 
-`a_span`/`b_span` are the *tight* extent of the chunk's runs on each axis; `b_span` is what
-lets a reverse query skip a chunk without decompressing it. **Tightness is a validated
+`b_enter0` is **not** `b_min`. The deltas begin at the first run, and under `order a` that
+is not the run with the smallest b. `a_min` doubles as the axis-a decode base, which holds
+only because `order a` makes the first run the smallest — under `order b` it would not.
+
+`codec` is per chunk and not inherited from the section: the `runs` section itself is stored
+uncompressed and each chunk blob inside it is compressed individually, so the reader has to
+be told which. Inferring it from `rawlen != clen` is wrong for a chunk that happens not to
+compress.
+
+A chunk blob is `u32 len[4]` — the four stream lengths in declaration order — followed by the
+four streams; `codec` applies to that whole blob.
+
+`a_span`/`b_span` are the *tight* extent of the chunk's runs on each axis, and `b_span` is
+what lets a reverse query skip a chunk without decompressing it. **Tightness is a validated
 invariant, not a convention** — every skip is silently wrong if a range is loose, and `.tui`
-never asserted it.
+never asserted it. Both are u32: a writer must close a chunk before its extent would exceed
+2^32 rather than let the field wrap, which is the same failure in a quieter form.
 
 Left uncompressed so it can be `pread` and binary-searched in place. A 1.3 Gb genome at 8192
-runs/chunk is ~3,200 chunks ≈ 154 KB.
+runs/chunk is ~3,200 chunks ≈ 205 KB.
 
 ### 2.3 Chunk directory `dir.b` — a permutation, not a copy
 

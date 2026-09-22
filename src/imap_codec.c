@@ -1,6 +1,8 @@
 /* imap_codec -- see imap_codec.h and doc/SPEC.md S1.2. */
 #include "imap_codec.h"
 
+#include <stdint.h>
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -106,6 +108,10 @@ int imap_decode_chunk(const imap_buf streams[IMAP_N_STREAMS], int64_t n,
                       int64_t a0, int64_t b_enter0, imap_run *out) {
     if (n <= 0) return 0;
     if ((size_t)((n + 7) / 8) > streams[IMAP_STREAM_STRAND].n) return -1;
+    /* The bases come from the chunk directory, i.e. off disk. A negative one makes the
+     * overflow guards below overflow themselves, so reject it here. Everything after
+     * this point stays non-negative by induction. */
+    if (a0 < 0 || b_enter0 < 0) return -1;
 
     const uint8_t *pa  = streams[IMAP_STREAM_A].p,   *ea  = pa  + streams[IMAP_STREAM_A].n;
     const uint8_t *pb  = streams[IMAP_STREAM_B].p,   *eb  = pb  + streams[IMAP_STREAM_B].n;
@@ -121,11 +127,24 @@ int imap_decode_chunk(const imap_buf streams[IMAP_N_STREAMS], int64_t n,
         if (imap_get_uvarint(&pb, eb, &ub) != 0) return -1;
         if (imap_get_uvarint(&pl, el, &ul) != 0) return -1;
 
+        /* Everything above came off disk and is attacker-controlled. Each step below
+         * is checked before it is taken, because signed overflow is undefined and a
+         * caller handed a negative len would use it as a size. */
         uint8_t s = (uint8_t)((str[i >> 3] >> (i & 7)) & 1u);
-        int64_t len = (int64_t)ul + 1;
+        if (ul > (uint64_t)INT64_MAX - 1) return -1;
+        int64_t len = (int64_t)ul + 1;                       /* len >= 1 by construction */
+
+        if (ua > (uint64_t)(INT64_MAX - prev_a_exit)) return -1;
         int64_t a = prev_a_exit + (int64_t)ua;
-        int64_t enter = prev_b_exit + imap_unzigzag(ub);
-        int64_t b = s ? enter - len : enter;
+
+        int64_t db = imap_unzigzag(ub);
+        if (db > 0 ? (prev_b_exit > INT64_MAX - db) : (prev_b_exit < INT64_MIN - db)) return -1;
+        int64_t enter = prev_b_exit + db;
+
+        int64_t b = enter;
+        if (s) { b = enter - len; }                          /* enter >= len checked below */
+        if (a < 0 || b < 0) return -1;
+        if (len > INT64_MAX - a || len > INT64_MAX - b) return -1;
 
         out[i].a = a;
         out[i].b = b;

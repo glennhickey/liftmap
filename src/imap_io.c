@@ -82,7 +82,9 @@ imap_io *imap_io_open_mem(const void *data, int64_t len) {
 /* ----------------------------------------------------------------- slice */
 
 imap_io *imap_io_slice(imap_io *parent, int64_t base, int64_t len) {
-    if (!parent || base < 0 || len < 0 || base + len > parent->len) return NULL;
+    /* base+len would be signed overflow (UB) for large inputs; compare by subtraction. */
+    if (!parent || base < 0 || len < 0) return NULL;
+    if (base > parent->len || len > parent->len - base) return NULL;
     imap_io *io = (imap_io *)calloc(1, sizeof *io);
     if (!io) return NULL;
     io->be = parent->be; io->ctx = parent->ctx;
