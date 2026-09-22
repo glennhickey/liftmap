@@ -9,7 +9,7 @@ OBJ  = $(SRC:.c=.o)
 LIB  = libliftmap.a
 TESTBINS = bin/xcheck bin/roundtrip bin/robust bin/query bin/fuzz_reader bin/sections
 
-all: $(LIB) $(TESTBINS)
+all: $(LIB) bin/liftmap $(TESTBINS)
 
 $(LIB): $(OBJ)
 	$(AR) rcs $@ $(OBJ)
@@ -17,13 +17,17 @@ $(LIB): $(OBJ)
 bin/%: tests/%.c $(LIB) | bin
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
+bin/liftmap: tools/liftmap.c $(LIB) | bin
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LIB) $(LDLIBS)
+
 bin:
 	mkdir -p bin
 
-# Round-trip and robustness run on generated data; xcheck needs runs from a caller.
-check: $(TESTBINS)
-	@bin/robust $${LMAP_TEST_FILE:-/dev/null} 2>/dev/null || \
-	  echo "check: set LMAP_TEST_FILE to an .lmap file (see tests/README)"
+# Self-contained: generated data only.  roundtrip/query/xcheck take real runs from a caller
+# (see their usage lines); robust also runs inside test_tools on a generated file.
+check: all
+	bin/sections $${TMPDIR:-/tmp}/liftmap_sections_test.lmap
+	python3 tests/test_tools.py bin
 
 clean:
 	rm -f $(OBJ) $(LIB); rm -rf bin

@@ -49,10 +49,36 @@ liftmap began as `libintervalmap`; its history is carried over.
 4. Both axes are indexed from the same payload bytes.
 5. Extension slots are reserved up front (`aux.0`–`aux.3`).
 
+## Command line
+
+```
+liftmap from-paf   in.paf[.gz]   out.lmap   [--swap] [--allow-overlap]
+liftmap from-chain in.chain[.gz] out.lmap   [--swap] [--allow-overlap]
+liftmap to-paf     in.lmap [out.paf]        [--max-gap N]
+liftmap to-chain   in.lmap [out.chain]      [--max-gap N]
+liftmap lift       in.lmap in.bed [out.bed] [--from a|b]
+liftmap dump | info | verify  in.lmap
+```
+
+Axis a is the sequence named first in each record — the PAF query, the chain target — so
+a → b is each format's own lift direction. PAF needs `cg:Z:` CIGARs.
+
+Import keeps the aligned base pairs and their strands, as the unique set of maximal runs:
+the same base pairs give the same file however they were split into records, and duplicate
+records collapse. Scores, mapping qualities and record boundaries are not kept; export
+regroups runs into records across gaps of at most `--max-gap` bp and writes placeholder
+scores. If a base of axis a aligns more than once (secondary alignments, or `--swap` onto
+a sequence with several copies), import refuses unless `--allow-overlap`.
+
+Checked against independent tools on the evolver mammals HAL (8 branches): `lift` agrees
+with `halLiftover` on 294,220 single-base mappings in both directions, and with UCSC
+`liftOver` (via `to-chain`, and `chainSwap` for the reverse) on 73,604, strands included.
+
 ## Building
 
 ```
-make            # libliftmap.a and the test programs in bin/
+make            # libliftmap.a, bin/liftmap and the test programs
+make check      # self-contained: generated data, brute-force oracle
 ```
 
 ## Licence
