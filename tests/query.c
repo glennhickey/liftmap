@@ -42,7 +42,8 @@ static uint64_t rng = 88172645463325252ULL;
 static uint64_t xr(void) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; }
 
 int main(int argc, char **argv) {
-    if (argc != 4) { fprintf(stderr,"usage: query runs.bin out.imap nqueries\n"); return 2; }
+    if (argc != 4 && argc != 5) { fprintf(stderr,"usage: query runs.bin out.imap nqueries [a|b]\n"); return 2; }
+    int order = (argc == 5 && argv[4][0] == 'b') ? IMAP_ORDER_B : IMAP_ORDER_A;
     FILE *fp = fopen(argv[1],"rb"); if (!fp) { perror("runs"); return 2; }
     fseek(fp,0,SEEK_END); long sz=ftell(fp); fseek(fp,0,SEEK_SET);
     long n = sz/(long)sizeof(inrec);
@@ -54,6 +55,7 @@ int main(int argc, char **argv) {
     for (long i=0;i<n;i++) r[i].am = na-1-r[i].am;          /* remap: ids no longer in input order */
 
     imap_writer *w = imap_writer_open(argv[2],"hal2.edge","imap 1\n");
+    if (imap_writer_set_order(w, order) != 0) { fprintf(stderr,"set_order failed\n"); return 1; }
     char nm[64];
     for (int32_t i=0;i<na;i++){ snprintf(nm,sizeof nm,"a%d",i); imap_writer_add_member(w,0,nm,1ULL<<40); }
     for (int32_t i=0;i<nb;i++){ snprintf(nm,sizeof nm,"b%d",i); imap_writer_add_member(w,1,nm,1ULL<<40); }
@@ -63,6 +65,7 @@ int main(int argc, char **argv) {
     if (imap_writer_close(w)) { fprintf(stderr,"close failed\n"); return 1; }
     imap_file *f = imap_open(argv[2]);
     if (!f) { fprintf(stderr,"open failed (invariant check?)\n"); return 1; }
+    if (imap_order(f) != order) { fprintf(stderr,"order not round-tripped\n"); return 1; }
 
     /* index input runs by member on each axis, for the oracle */
     long *ca = calloc((size_t)na+1,sizeof *ca), *cb = calloc((size_t)nb+1,sizeof *cb);
@@ -115,7 +118,7 @@ int main(int argc, char **argv) {
         total_hits += ne;
         free(got);
     }
-    printf("%ld queries, %ld hits compared, %ld mismatches\n", nq, total_hits, fails);
+    printf("order %c: %ld queries, %ld hits compared, %ld mismatches\n", order ? 'b' : 'a', nq, total_hits, fails);
     printf("mean chunks decoded per query, by half-width:\n  %-9s", "");
     for (int k=0;k<NW;k++) printf("%10lld", (long long)widths[k]);
     for (int ax=0; ax<2; ax++) {

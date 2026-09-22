@@ -166,10 +166,10 @@ Under `order b`, chunks are still *cut* in axis-a order (so `dir.a` extents stay
 and binary-searchable) and each chunk is then sorted by `(b, a)` internally — the layout
 `.tui` already uses. Axis a is then `zigzag`, and a `query_a` result must be re-sorted.
 
-**Implementation status.** The C writer implements `order a` and `seqbound both` only,
-and encodes axis a as `uvarint`; it rejects a chunk whose extent would not fit the u32
-span fields rather than letting one wrap. A file declaring `order b` or
-`field a ... enc zigzag` is legal per this document but is not yet produced or read.
+**Implementation status.** The C library implements both orders with `seqbound both`,
+recorded in header feature bit 0 (section 2). It rejects a chunk whose extent would not fit
+the u32 span fields rather than letting one wrap. Order b is written by cutting chunks in
+axis-a order as usual and sorting each one by `(b, a)` before encoding.
 
 ---
 
@@ -183,6 +183,7 @@ HEADER  (64 B, at offset 0 — sized so format sniffers that read 64 bytes see a
   8   u32     imap_major
   12  u32     imap_minor
   16  u64     feature_flags      unknown bit set => reader MUST refuse
+                                 bit 0: runs within a chunk are in order b
   24  u8[32]  profile            NUL-padded, e.g. "hal2.edge"
   56  u64     reserved (0)
 
@@ -196,9 +197,15 @@ TRAILER (32 B, last 32 bytes of the file)
   8   u64     footer_len
   16  u32     footer_crc32          CRC-32 (IEEE); computed in bounded steps,
                                  since zlib's uInt truncates a >4 GiB length
-  20  u32     reserved (0)
+  20  u32     header_crc32          CRC-32 of the 64-byte header
   24  u8[8]   magic (repeated)
 ```
+
+**The header is checksummed, and verified before any field in it is trusted**, because
+`feature_flags` decides how every chunk decodes. Before it was covered, flipping bit 0 on a
+real order-a file made the reader open it as order b: the per-run containment checks
+rejected 11,199 of its 11,218 chunks, and the other 19 decoded without complaint into
+different runs.
 
 Open = `pread` the last 32 B, then `pread` the footer. Nothing else is read until queried.
 
@@ -234,14 +241,22 @@ refuses a file where either property fails. Little-endian, in this order:
    0  u32 a_member       4  u32 b_member
    8  u64 a_min         16  u32 a_span     20  u32 b_span
   24  u64 b_min
-  32  u64 b_enter0      <- the first run's axis-b entry point; a decode base
+  32  u64 base          <- decode base of the NON-ordering axis (below)
   40  u64 off           <- relative to the start of the `runs` section
   48  u32 clen          52  u32 rawlen     56  u32 n_runs     60  u32 codec
 ```
 
-`b_enter0` is **not** `b_min`. The deltas begin at the first run, and under `order a` that
-is not the run with the smallest b. `a_min` doubles as the axis-a decode base, which holds
-only because `order a` makes the first run the smallest — under `order b` it would not.
+Decoding a chunk needs the first run's position on both axes. The first run in stored order
+is the minimum on the *ordering* axis, so that base is already in the entry; `base` holds the
+other one:
+
+| order | axis-a base | axis-b base |
+|---|---|---|
+| a | `a_min` | `base` = first run's b entry point (`b+len` if reverse, else `b`) |
+| b | `base` = first run's a | `b_min` |
+
+Neither stored base is a minimum: under order a the first run is not the one with the
+smallest b, and under order b it is not the one with the smallest a.
 
 `codec` is per chunk and not inherited from the section: the `runs` section itself is stored
 uncompressed and each chunk blob inside it is compressed individually, so the reader has to
@@ -452,10 +467,11 @@ runs, T = 708,019 columns) was read with tui's own reader and written through th
 - reverse lift: `tui_genome_lift_column` vs `query_b` over every column and all 9 genomes —
   5,041,395 matches, 0 mismatches
 
-That transcode was written in `order a`, the only order the writer implements yet, and came
-out 43% larger than the `.tui` (3.12 vs 2.18 B/run) — which is what the order table above
-predicts. **`order b` must be implemented before `.tui` can move onto this library.** With
-it, the reference codec measures 2.098 B/run against tui's 2.151.
+Written in `order a` that transcode came out 43% larger than the `.tui` (3.12 vs 2.18
+B/run), exactly as the order table above predicts. **Written in `order b` — the `taffy.tui`
+profile — it is 267,804 bytes against the `.tui`'s 268,906: parity, 0.4% smaller**, with the
+same three checks at zero mismatches. The reference codec puts per-stream compression
+another ~2.5% lower (2.098 B/run); the C writer still compresses each chunk as one blob.
 
 Still open, to be measured rather than argued:
 

@@ -31,6 +31,7 @@ def repair(buf):
         if so+sl>n: return None
         struct.pack_into('<I',b,crcpos, zlib.crc32(bytes(b[so:so+sl])) & 0xffffffff)
     struct.pack_into('<I',b,n-32+16, zlib.crc32(bytes(b[foff:foff+flen])) & 0xffffffff)
+    struct.pack_into('<I',b,n-32+20, zlib.crc32(bytes(b[0:64])) & 0xffffffff)
     return bytes(b)
 
 src=open(sys.argv[1],'rb').read()

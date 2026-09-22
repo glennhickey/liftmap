@@ -115,30 +115,40 @@ def chunk_bounds(a, b, ln, amem, bmem, count, bspan, seqbound):
 
 # --- run codec (SPEC 1.2) ---------------------------------------------------
 
-def encode_chunk(a, b, ln, rev, a_enc="uvarint"):
-    """Return the chunk's streams, in declaration order: a, b, len, strand."""
+def _b_ref(b, ln, rev, order):
+    """Axis-b reference points for the delta chain.  Order a follows the traversal
+    (strand-aware); order b uses the plain start/end, already monotone after sorting."""
+    if order == "a":
+        return b_enter_exit(b, ln, rev)
+    return b, b + ln
+
+
+def encode_chunk(a, b, ln, rev, order="a"):
+    """Return the chunk's streams, in declaration order: a, b, len, strand.
+
+    Runs must already be in `order`: axis-a order for "a", (b, a) order for "b".
+    """
     prev_a_exit = np.concatenate(([a[0]], (a + ln)[:-1]))
     ga = a - prev_a_exit
 
-    enter, exit_ = b_enter_exit(b, ln, rev)
+    enter, exit_ = _b_ref(b, ln, rev, order)
     prev_b_exit = np.concatenate(([enter[0]], exit_[:-1]))
     gb = enter - prev_b_exit
 
-    streams = [u_enc(ga) if a_enc == "uvarint" else zz_enc(ga),
-               zz_enc(gb),
-               u_enc(ln - 1),
-               bitmap_enc(rev)]
-    return streams
+    return [u_enc(ga) if order == "a" else zz_enc(ga),
+            zz_enc(gb),
+            u_enc(ln - 1),
+            bitmap_enc(rev)]
 
 
-def decode_chunk(streams, n, a0, b_enter0, a_enc="uvarint"):
+def decode_chunk(streams, n, base_a, base_b, order="a"):
     """Inverse of encode_chunk.
 
-    `a0` and `b_enter0` are the chunk's bases and come from the chunk directory: every delta
-    stream restarts at zero at a chunk boundary, which is what makes chunks independently
-    decodable.
+    base_a is the first run's a.  base_b is the first run's axis-b entry point:
+    b_enter under order a, plain b under order b.  Both come from the chunk directory:
+    every delta stream restarts at zero at a chunk boundary.
     """
-    ga, _ = (u_dec(streams[0], n) if a_enc == "uvarint" else zz_dec(streams[0], n))
+    ga, _ = (u_dec(streams[0], n) if order == "a" else zz_dec(streams[0], n))
     gb, _ = zz_dec(streams[1], n)
     lm1, _ = u_dec(streams[2], n)
     ln = lm1 + 1
@@ -146,15 +156,17 @@ def decode_chunk(streams, n, a0, b_enter0, a_enc="uvarint"):
 
     a = np.empty(n, np.int64)
     b = np.empty(n, np.int64)
-    pa = a0
-    prev_exit = b_enter0
+    pa = base_a
+    prev_exit = base_b
     for i in range(n):
         a[i] = pa + ga[i]
         pa = a[i] + ln[i]
         enter = prev_exit + gb[i]
-        b[i] = enter if rev[i] == 0 else enter - ln[i]
-        prev_exit = (b[i] + ln[i]) if rev[i] == 0 else b[i]
-
+        b[i] = enter - ln[i] if (order == "a" and rev[i]) else enter
+        if order == "a":
+            prev_exit = (b[i] + ln[i]) if rev[i] == 0 else b[i]
+        else:
+            prev_exit = b[i] + ln[i]
     return a, b, ln, rev
 
 

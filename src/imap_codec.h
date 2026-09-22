@@ -22,6 +22,12 @@
 #define IMAP_STREAM_STRAND  3
 #define IMAP_N_STREAMS      4
 
+/* Run order within a chunk (SPEC 1.3).  Order a: axis a is a uvarint delta from the
+ * previous run's end and axis b follows the traversal (strand-aware).  Order b: runs
+ * sorted by (b, a); both axes are zigzag deltas from the previous run's end. */
+#define IMAP_ORDER_A 0
+#define IMAP_ORDER_B 1
+
 /* One run, in the coordinates of its chunk's members. */
 typedef struct {
     int64_t a;
@@ -49,13 +55,15 @@ static inline int64_t imap_b_enter(int64_t b, int64_t len, uint8_t s) { return s
 static inline int64_t imap_b_exit (int64_t b, int64_t len, uint8_t s) { return s ? b : b + len; }
 
 /* --- chunk encode / decode ---
- * encode: fills streams[IMAP_N_STREAMS]; each buffer is malloc'd, caller frees.
- *         returns 0 on success, -1 on allocation failure.
- * decode: writes n runs into out[]; a0/b_enter0 are the chunk bases.
- *         returns 0 on success, -1 on malformed input. */
-int imap_encode_chunk(const imap_run *runs, int64_t n, imap_buf streams[IMAP_N_STREAMS]);
-int imap_decode_chunk(const imap_buf streams[IMAP_N_STREAMS], int64_t n,
-                      int64_t a0, int64_t b_enter0, imap_run *out);
+ * encode: runs must already be in `order` (the writer sorts); fills streams[], each
+ *         buffer malloc'd, caller frees.  Returns 0, or -1 on bad input or no memory.
+ * decode: writes n runs into out[].  base_a is the first run's a.  base_b is the first
+ *         run's axis-b entry point: imap_b_enter(b,len,strand) under order a, plain b
+ *         under order b.  Returns 0, or -1 on malformed input. */
+int imap_encode_chunk(const imap_run *runs, int64_t n, int order,
+                      imap_buf streams[IMAP_N_STREAMS]);
+int imap_decode_chunk(const imap_buf streams[IMAP_N_STREAMS], int64_t n, int order,
+                      int64_t base_a, int64_t base_b, imap_run *out);
 
 void imap_buf_free(imap_buf *b);
 

@@ -24,6 +24,11 @@
 #define IMAP_MAX_CHUNK_RAW   (1u << 30)
 #define IMAP_ZLIB_MAX_RATIO  1032u      /* deflate's maximum expansion */
 
+/* Header feature flags (SPEC 2).  A reader refuses any bit it does not know, so a
+ * file using a newer feature is rejected by an older reader, never misread. */
+#define IMAP_FEAT_ORDER_B   (1ull << 0)     /* runs within a chunk are in order b */
+#define IMAP_FEAT_KNOWN     (IMAP_FEAT_ORDER_B)
+
 #define IMAP_CODEC_NONE 0
 #define IMAP_CODEC_ZLIB 1
 
@@ -32,7 +37,10 @@ typedef struct {
     uint32_t a_member, b_member;
     uint64_t a_min;  uint32_t a_span;
     uint64_t b_min;  uint32_t b_span;
-    uint64_t b_enter0;          /* first run's axis-b entry point -- a decode base */
+    uint64_t base;              /* decode base of the NON-ordering axis (SPEC 2.2):
+                                 * order a: the first run's axis-b entry point;
+                                 * order b: the first run's a.  The ordering axis's
+                                 * base is its min, since the first run is the min. */
     uint64_t off;               /* within the runs section */
     uint32_t clen, rawlen, n_runs;
     uint32_t codec;            /* IMAP_CODEC_* for this chunk's blob */
@@ -62,6 +70,10 @@ int imap_writer_add_run(imap_writer *w, uint32_t a_member, uint32_t b_member,
                         int64_t a, int64_t b, int64_t len, uint8_t strand);
 
 int imap_writer_set_params(imap_writer *w, uint32_t count, uint64_t bspan, int codec);
+
+/* IMAP_ORDER_A (default) or IMAP_ORDER_B.  Only before the first run.  Chunks are cut in
+ * axis-a order either way; under order b each chunk is then sorted by (b, a). */
+int imap_writer_set_order(imap_writer *w, int order);
 int imap_writer_close(imap_writer *w);          /* writes footer+trailer, frees */
 void imap_writer_abort(imap_writer *w);
 
@@ -75,6 +87,7 @@ void       imap_close(imap_file *f);
 
 const char *imap_profile(const imap_file *f);
 const char *imap_schema_text(const imap_file *f);
+int         imap_order(const imap_file *f);          /* IMAP_ORDER_A or IMAP_ORDER_B */
 uint32_t    imap_n_chunks(const imap_file *f);
 uint32_t    imap_n_members(const imap_file *f, int axis);
 const imap_member *imap_member_at(const imap_file *f, int axis, uint32_t i);

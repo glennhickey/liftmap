@@ -60,11 +60,23 @@ static int buf_put_uvarint(imap_buf *b, uint64_t v) {
 
 /* ------------------------------------------------------------------- encode */
 
-int imap_encode_chunk(const imap_run *runs, int64_t n, imap_buf streams[IMAP_N_STREAMS]) {
+/* Axis-b reference points for the delta chain (SPEC 1.2).  Under order a the chain
+ * follows the traversal, so a reverse run is entered at b+len and left at b; under
+ * order b runs are sorted by b-start and the plain start/end is already monotone. */
+static inline int64_t b_ref_enter(int order, const imap_run *r) {
+    return order == IMAP_ORDER_A ? imap_b_enter(r->b, r->len, r->strand) : r->b;
+}
+static inline int64_t b_ref_exit(int order, const imap_run *r) {
+    return order == IMAP_ORDER_A ? imap_b_exit(r->b, r->len, r->strand) : r->b + r->len;
+}
+
+int imap_encode_chunk(const imap_run *runs, int64_t n, int order,
+                      imap_buf streams[IMAP_N_STREAMS]) {
     for (int i = 0; i < IMAP_N_STREAMS; i++) {
         streams[i].p = NULL;
         streams[i].n = streams[i].cap = 0;
     }
+    if (order != IMAP_ORDER_A && order != IMAP_ORDER_B) return -1;
     if (n <= 0) return 0;
 
     /* strand is a bitmap: size it up front and write bits directly */
@@ -74,17 +86,20 @@ int imap_encode_chunk(const imap_run *runs, int64_t n, imap_buf streams[IMAP_N_S
     streams[IMAP_STREAM_STRAND].n = nbytes;
 
     int64_t prev_a_exit = runs[0].a;
-    int64_t prev_b_exit = imap_b_enter(runs[0].b, runs[0].len, runs[0].strand);
+    int64_t prev_b_exit = b_ref_enter(order, &runs[0]);
 
     for (int64_t i = 0; i < n; i++) {
         const imap_run *r = &runs[i];
 
         int64_t ga = r->a - prev_a_exit;
-        if (ga < 0) goto fail;            /* axis a must not go backwards in a chunk */
-        if (buf_put_uvarint(&streams[IMAP_STREAM_A], (uint64_t)ga) != 0) goto fail;
+        if (order == IMAP_ORDER_A) {
+            if (ga < 0) goto fail;        /* under order a, axis a never goes backwards */
+            if (buf_put_uvarint(&streams[IMAP_STREAM_A], (uint64_t)ga) != 0) goto fail;
+        } else {
+            if (buf_put_uvarint(&streams[IMAP_STREAM_A], imap_zigzag(ga)) != 0) goto fail;
+        }
 
-        int64_t enter = imap_b_enter(r->b, r->len, r->strand);
-        int64_t gb = enter - prev_b_exit;
+        int64_t gb = b_ref_enter(order, r) - prev_b_exit;
         if (buf_put_uvarint(&streams[IMAP_STREAM_B], imap_zigzag(gb)) != 0) goto fail;
 
         if (r->len < 1) goto fail;
@@ -93,7 +108,7 @@ int imap_encode_chunk(const imap_run *runs, int64_t n, imap_buf streams[IMAP_N_S
         if (r->strand) streams[IMAP_STREAM_STRAND].p[i >> 3] |= (uint8_t)(1u << (i & 7));
 
         prev_a_exit = r->a + r->len;
-        prev_b_exit = imap_b_exit(r->b, r->len, r->strand);
+        prev_b_exit = b_ref_exit(order, r);
     }
     return 0;
 
@@ -104,22 +119,30 @@ fail:
 
 /* ------------------------------------------------------------------- decode */
 
-int imap_decode_chunk(const imap_buf streams[IMAP_N_STREAMS], int64_t n,
-                      int64_t a0, int64_t b_enter0, imap_run *out) {
+/* checked signed add: 0 and *out on success, -1 on overflow */
+static inline int add_ok(int64_t x, int64_t d, int64_t *out) {
+    if (d > 0 ? x > INT64_MAX - d : x < INT64_MIN - d) return -1;
+    *out = x + d;
+    return 0;
+}
+
+int imap_decode_chunk(const imap_buf streams[IMAP_N_STREAMS], int64_t n, int order,
+                      int64_t base_a, int64_t base_b, imap_run *out) {
+    if (order != IMAP_ORDER_A && order != IMAP_ORDER_B) return -1;
     if (n <= 0) return 0;
     if ((size_t)((n + 7) / 8) > streams[IMAP_STREAM_STRAND].n) return -1;
-    /* The bases come from the chunk directory, i.e. off disk. A negative one makes the
-     * overflow guards below overflow themselves, so reject it here. Everything after
-     * this point stays non-negative by induction. */
-    if (a0 < 0 || b_enter0 < 0) return -1;
+    /* The bases come from the chunk directory, i.e. off disk.  A negative one would
+     * make every later bound meaningless, so reject it here; everything after this
+     * point is checked step by step and stays non-negative. */
+    if (base_a < 0 || base_b < 0) return -1;
 
     const uint8_t *pa  = streams[IMAP_STREAM_A].p,   *ea  = pa  + streams[IMAP_STREAM_A].n;
     const uint8_t *pb  = streams[IMAP_STREAM_B].p,   *eb  = pb  + streams[IMAP_STREAM_B].n;
     const uint8_t *pl  = streams[IMAP_STREAM_LEN].p, *el  = pl  + streams[IMAP_STREAM_LEN].n;
     const uint8_t *str = streams[IMAP_STREAM_STRAND].p;
 
-    int64_t prev_a_exit = a0;
-    int64_t prev_b_exit = b_enter0;
+    int64_t prev_a_exit = base_a;
+    int64_t prev_b_exit = base_b;
 
     for (int64_t i = 0; i < n; i++) {
         uint64_t ua, ub, ul;
@@ -127,22 +150,23 @@ int imap_decode_chunk(const imap_buf streams[IMAP_N_STREAMS], int64_t n,
         if (imap_get_uvarint(&pb, eb, &ub) != 0) return -1;
         if (imap_get_uvarint(&pl, el, &ul) != 0) return -1;
 
-        /* Everything above came off disk and is attacker-controlled. Each step below
-         * is checked before it is taken, because signed overflow is undefined and a
-         * caller handed a negative len would use it as a size. */
+        /* Everything above is attacker-controlled.  Each step is checked before it is
+         * taken: signed overflow is undefined, and a caller handed a negative len
+         * would use it as a size. */
         uint8_t s = (uint8_t)((str[i >> 3] >> (i & 7)) & 1u);
         if (ul > (uint64_t)INT64_MAX - 1) return -1;
-        int64_t len = (int64_t)ul + 1;                       /* len >= 1 by construction */
+        int64_t len = (int64_t)ul + 1;                        /* len >= 1 */
 
-        if (ua > (uint64_t)(INT64_MAX - prev_a_exit)) return -1;
-        int64_t a = prev_a_exit + (int64_t)ua;
+        int64_t a;
+        if (order == IMAP_ORDER_A) {
+            if (ua > (uint64_t)(INT64_MAX - prev_a_exit)) return -1;
+            a = prev_a_exit + (int64_t)ua;
+        } else if (add_ok(prev_a_exit, imap_unzigzag(ua), &a) != 0) return -1;
 
-        int64_t db = imap_unzigzag(ub);
-        if (db > 0 ? (prev_b_exit > INT64_MAX - db) : (prev_b_exit < INT64_MIN - db)) return -1;
-        int64_t enter = prev_b_exit + db;
+        int64_t enter;
+        if (add_ok(prev_b_exit, imap_unzigzag(ub), &enter) != 0) return -1;
+        int64_t b = (order == IMAP_ORDER_A && s) ? enter - len : enter;   /* enter>=0, len>=1 */
 
-        int64_t b = enter;
-        if (s) { b = enter - len; }                          /* enter >= len checked below */
         if (a < 0 || b < 0) return -1;
         if (len > INT64_MAX - a || len > INT64_MAX - b) return -1;
 
@@ -152,7 +176,7 @@ int imap_decode_chunk(const imap_buf streams[IMAP_N_STREAMS], int64_t n,
         out[i].strand = s;
 
         prev_a_exit = a + len;
-        prev_b_exit = imap_b_exit(b, len, s);
+        prev_b_exit = order == IMAP_ORDER_A ? imap_b_exit(b, len, s) : b + len;
     }
     return 0;
 }

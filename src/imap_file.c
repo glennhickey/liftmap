@@ -66,7 +66,7 @@ typedef struct {
 struct imap_writer {
     FILE    *fp;
     char    *path, *profile, *schema;
-    uint32_t count;  uint64_t bspan;  int codec;
+    uint32_t count;  uint64_t bspan;  int codec;  int order;
 
     wmember *mem[2];  uint32_t n_mem[2], cap_mem[2];
 
@@ -87,7 +87,7 @@ imap_writer *imap_writer_open(const char *path, const char *profile, const char 
     w->path = strdup(path);
     w->profile = strdup(profile ? profile : "");
     w->schema = strdup(schema ? schema : "");
-    w->count = 8192; w->bspan = 1000000; w->codec = IMAP_CODEC_ZLIB;
+    w->count = 8192; w->bspan = 1000000; w->codec = IMAP_CODEC_ZLIB; w->order = IMAP_ORDER_A;
     if (!w->path || !w->profile || !w->schema) { imap_writer_abort(w); return NULL; }
     return w;
 }
@@ -97,6 +97,12 @@ int imap_writer_set_params(imap_writer *w, uint32_t count, uint64_t bspan, int c
     if (count == 0 || count > IMAP_MAX_CHUNK_RUNS) return -1;
     if (codec != IMAP_CODEC_NONE && codec != IMAP_CODEC_ZLIB) return -1;
     w->count = count; w->bspan = bspan; w->codec = codec; return 0;
+}
+
+int imap_writer_set_order(imap_writer *w, int order) {
+    if (!w || w->n_chunks || w->n_pend) return -1;      /* only before any run */
+    if (order != IMAP_ORDER_A && order != IMAP_ORDER_B) return -1;
+    w->order = order; return 0;
 }
 
 int32_t imap_writer_add_member(imap_writer *w, int axis, const char *name, uint64_t length) {
@@ -116,10 +122,19 @@ int32_t imap_writer_add_member(imap_writer *w, int axis, const char *name, uint6
 }
 
 /* Encode and append the pending chunk. */
+static int cmp_run_b(const void *x, const void *y) {
+    const imap_run *p = (const imap_run *)x, *q = (const imap_run *)y;
+    if (p->b != q->b) return p->b < q->b ? -1 : 1;
+    return (p->a > q->a) - (p->a < q->a);
+}
+
 static int flush_chunk(imap_writer *w) {
     if (w->n_pend == 0) return 0;
+    /* The chunk was cut in axis-a order; under order b it is stored sorted by (b, a).
+     * Axis a is a partial function, so (b, a) is a total order with no ties. */
+    if (w->order == IMAP_ORDER_B) qsort(w->pend, w->n_pend, sizeof *w->pend, cmp_run_b);
     imap_buf st[IMAP_N_STREAMS];
-    if (imap_encode_chunk(w->pend, w->n_pend, st) != 0) return -1;
+    if (imap_encode_chunk(w->pend, w->n_pend, w->order, st) != 0) return -1;
 
     /* blob = u32 x4 stream lengths, then the streams */
     vec blob = {0};
@@ -146,19 +161,29 @@ static int flush_chunk(imap_writer *w) {
         if (!c) { free(z); vec_free(&blob); return -1; }
         w->chunks = c; w->cap_chunks = cap;
     }
-    uint64_t a_span64 = (uint64_t)(w->pend[w->n_pend-1].a + w->pend[w->n_pend-1].len)
-                        - (uint64_t)w->pend[0].a;
+    /* extents from min/max rather than first/last: under order b the runs are no
+     * longer in axis-a order by the time we get here */
+    int64_t amin = w->pend[0].a, amax = w->pend[0].a + w->pend[0].len;
+    for (uint32_t k = 1; k < w->n_pend; k++) {
+        if (w->pend[k].a < amin) amin = w->pend[k].a;
+        if (w->pend[k].a + w->pend[k].len > amax) amax = w->pend[k].a + w->pend[k].len;
+    }
+    uint64_t a_span64 = (uint64_t)(amax - amin);
     uint64_t b_span64 = w->pend_bmax - w->pend_bmin;
     if (a_span64 > 0xFFFFFFFFull || b_span64 > 0xFFFFFFFFull) { free(z); vec_free(&blob); return -1; }
 
     imap_chunk *c = &w->chunks[w->n_chunks];
     memset(c, 0, sizeof *c);
     c->a_member = w->pend_amem; c->b_member = w->pend_bmem;
-    c->a_min = (uint64_t)w->pend[0].a;
+    c->a_min = (uint64_t)amin;
     c->a_span = (uint32_t)a_span64;
     c->b_min = w->pend_bmin;
     c->b_span = (uint32_t)b_span64;
-    c->b_enter0 = (uint64_t)imap_b_enter(w->pend[0].b, w->pend[0].len, w->pend[0].strand);
+    /* the first run in stored order is the min on the ordering axis, so only the other
+     * axis's base needs storing */
+    c->base = w->order == IMAP_ORDER_A
+            ? (uint64_t)imap_b_enter(w->pend[0].b, w->pend[0].len, w->pend[0].strand)
+            : (uint64_t)w->pend[0].a;
     c->off = w->runs.n;
     c->clen = (uint32_t)bodylen;
     c->rawlen = (uint32_t)blob.n;
@@ -316,7 +341,7 @@ int imap_writer_close(imap_writer *w) {
         if (vec_put32(&dira, c->a_member) || vec_put32(&dira, c->b_member) ||
             vec_put64(&dira, c->a_min) || vec_put32(&dira, c->a_span) ||
             vec_put32(&dira, c->b_span) || vec_put64(&dira, c->b_min) ||
-            vec_put64(&dira, c->b_enter0) || vec_put64(&dira, c->off) ||
+            vec_put64(&dira, c->base) || vec_put64(&dira, c->off) ||
             vec_put32(&dira, c->clen) || vec_put32(&dira, c->rawlen) ||
             vec_put32(&dira, c->n_runs) || vec_put32(&dira, c->codec)) goto done;
     }
@@ -353,13 +378,15 @@ int imap_writer_close(imap_writer *w) {
     if (build_memdir(w, 1, &mb) != 0) goto done;
 
     /* --- header --- */
+    uint32_t hdr_crc;
     {
         uint8_t hdr[IMAP_HEADER_SIZE];
         memset(hdr, 0, sizeof hdr);
         memcpy(hdr, IMAP_MAGIC, 8);
         st32(hdr + 8, 1); st32(hdr + 12, 0);
-        st64(hdr + 16, 0);
+        st64(hdr + 16, w->order == IMAP_ORDER_B ? IMAP_FEAT_ORDER_B : 0);
         strncpy((char *)hdr + 24, w->profile, 31);
+        hdr_crc = crc_all(hdr, sizeof hdr);
         if (write_all(w->fp, hdr, sizeof hdr) != 0) goto done;
     }
 
@@ -411,6 +438,7 @@ int imap_writer_close(imap_writer *w) {
         st64(tr, foot_off);
         st64(tr + 8, (uint64_t)foot.n);
         st32(tr + 16, crc_all(foot.p, (uint64_t)foot.n));
+        st32(tr + 20, hdr_crc);       /* the header changes how every chunk decodes */
         memcpy(tr + 24, IMAP_MAGIC, 8);
         if (write_all(w->fp, tr, sizeof tr) != 0) goto done;
     }
@@ -443,6 +471,7 @@ struct imap_file {
     imap_io *io; int own_io;
     char profile[32];
     char *schema;
+    int order;
     imap_chunk *chunks; uint32_t n_chunks;
     uint32_t *dirb_id; uint64_t *dirb_max;
     imap_member *mem[2]; uint32_t n_mem[2];
@@ -502,12 +531,17 @@ imap_file *imap_open_io(imap_io *io, int own_io) {
     if (sz < IMAP_HEADER_SIZE + IMAP_TRAILER_SIZE) goto fail;
     if (imap_pread(io, hdr, 0, IMAP_HEADER_SIZE) != 0) goto fail;
     if (memcmp(hdr, IMAP_MAGIC, 8) != 0) goto fail;
-    if (ld32(hdr + 8) != 1) goto fail;                       /* major */
-    if (ld64(hdr + 16) != 0) goto fail;                      /* unknown feature bits */
-    memcpy(f->profile, hdr + 24, 31); f->profile[31] = 0;
-
     if (imap_pread(io, tr, sz - IMAP_TRAILER_SIZE, IMAP_TRAILER_SIZE) != 0) goto fail;
     if (memcmp(tr + 24, IMAP_MAGIC, 8) != 0) goto fail;
+    /* Verify the header before trusting any field in it.  The feature bits decide how
+     * every chunk decodes: a single flipped bit used to make some chunks decode, without
+     * complaint, into different runs. */
+    if (crc_all(hdr, IMAP_HEADER_SIZE) != ld32(tr + 20)) goto fail;
+    if (ld32(hdr + 8) != 1) goto fail;                       /* major */
+    uint64_t feat = ld64(hdr + 16);
+    if (feat & ~IMAP_FEAT_KNOWN) goto fail;                 /* a feature we don't know */
+    f->order = (feat & IMAP_FEAT_ORDER_B) ? IMAP_ORDER_B : IMAP_ORDER_A;
+    memcpy(f->profile, hdr + 24, 31); f->profile[31] = 0;
     uint64_t foff = ld64(tr), flen = ld64(tr + 8);
     if (foff < IMAP_HEADER_SIZE || flen > (uint64_t)sz || foff > (uint64_t)sz - flen) goto fail;
 
@@ -582,7 +616,7 @@ imap_file *imap_open_io(imap_io *io, int own_io) {
         c->a_member = ld32(e);      c->b_member = ld32(e + 4);
         c->a_min    = ld64(e + 8);  c->a_span   = ld32(e + 16);
         c->b_span   = ld32(e + 20); c->b_min    = ld64(e + 24);
-        c->b_enter0 = ld64(e + 32); c->off      = ld64(e + 40);
+        c->base     = ld64(e + 32); c->off      = ld64(e + 40);
         c->clen     = ld32(e + 48); c->rawlen   = ld32(e + 52);
         c->n_runs   = ld32(e + 56); c->codec = ld32(e + 60);
         if (c->codec != IMAP_CODEC_NONE && c->codec != IMAP_CODEC_ZLIB) goto tablefail;
@@ -596,8 +630,9 @@ imap_file *imap_open_io(imap_io *io, int own_io) {
         if (c->codec == IMAP_CODEC_NONE ? c->rawlen != c->clen
             : (uint64_t)c->rawlen > (uint64_t)IMAP_ZLIB_MAX_RATIO * c->clen + 64) goto tablefail;
         if (c->off > f->runs_len || c->clen > f->runs_len - c->off) goto tablefail;
-        /* a_min and b_enter0 are decode bases handed to imap_decode_chunk as int64. */
-        if (c->a_min > (uint64_t)INT64_MAX || c->b_enter0 > (uint64_t)INT64_MAX) goto tablefail;
+        /* a_min, b_min and base become int64 decode bases. */
+        if (c->a_min > (uint64_t)INT64_MAX || c->b_min > (uint64_t)INT64_MAX ||
+            c->base > (uint64_t)INT64_MAX) goto tablefail;
     }
     if (dirb && dirb_n == (uint64_t)f->n_chunks * IMAP_DIRB_ENTRY) {
         f->dirb_id  = malloc((f->n_chunks ? f->n_chunks : 1) * sizeof *f->dirb_id);
@@ -700,6 +735,7 @@ void imap_close(imap_file *f) {
 
 const char *imap_profile(const imap_file *f)     { return f ? f->profile : NULL; }
 const char *imap_schema_text(const imap_file *f) { return f ? f->schema : NULL; }
+int         imap_order(const imap_file *f)       { return f ? f->order : -1; }
 uint32_t    imap_n_chunks(const imap_file *f)    { return f ? f->n_chunks : 0; }
 uint32_t    imap_n_members(const imap_file *f, int axis) {
     return (f && (axis == 0 || axis == 1)) ? f->n_mem[axis] : 0;
@@ -755,8 +791,9 @@ int imap_read_chunk(imap_file *f, uint32_t i, imap_run *out) {
                 st[k].p = (uint8_t *)q; st[k].n = sl[k]; st[k].cap = sl[k];
                 q += sl[k];
             }
-            rc = imap_decode_chunk(st, c->n_runs, (int64_t)c->a_min,
-                                   (int64_t)c->b_enter0, out);
+            int64_t base_a = f->order == IMAP_ORDER_A ? (int64_t)c->a_min : (int64_t)c->base;
+            int64_t base_b = f->order == IMAP_ORDER_A ? (int64_t)c->base  : (int64_t)c->b_min;
+            rc = imap_decode_chunk(st, c->n_runs, f->order, base_a, base_b, out);
             /* Containment is what makes skipping a chunk on its extent sound: a run
              * outside the declared range could be missed by a query that skipped it. */
             uint64_t a_hi = c->a_min + c->a_span, b_hi = c->b_min + c->b_span;
@@ -822,6 +859,11 @@ static int scan_chunk(imap_file *f, uint32_t ci, int axis, int64_t lo, int64_t h
     return 0;
 }
 
+static int cmp_hit_a(const void *x, const void *y) {
+    const imap_hit *p = (const imap_hit *)x, *q = (const imap_hit *)y;
+    return (p->a > q->a) - (p->a < q->a);
+}
+
 int imap_query_a(imap_file *f, uint32_t m, int64_t lo, int64_t hi,
                  imap_hit **out, size_t *n, imap_query_stats *st) {
     if (!f || !out || !n || m >= f->n_mem[0] || lo < 0 || hi < lo) return -1;
@@ -844,7 +886,10 @@ int imap_query_a(imap_file *f, uint32_t m, int64_t lo, int64_t hi,
     }
     free(buf);
     if (rc != 0) { free(v.p); return -1; }
-    *out = v.p; *n = v.n;           /* runs are a-ordered within and across chunks */
+    /* Chunks are cut in axis-a order, so results are a-ordered across chunks; under
+     * order b they are b-ordered within one, so sort.  a is unique within a member. */
+    if (f->order == IMAP_ORDER_B && v.n > 1) qsort(v.p, v.n, sizeof *v.p, cmp_hit_a);
+    *out = v.p; *n = v.n;
     return 0;
 }
 

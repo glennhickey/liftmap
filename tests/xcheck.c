@@ -1,6 +1,7 @@
 /* xcheck -- encode runs with the C codec, verify self round-trip, dump streams.
  *
- * in:  binary file of records {int64 a; int64 b; int64 len; int64 strand}
+ * in:  binary file of records {int64 a; int64 b; int64 len; int64 strand}, already in
+ *      the requested order ("a", default, or "b" = sorted by (b, a))
  * out: binary file  {uint64 n; then per stream: uint64 len, bytes}
  * Exits non-zero if the C codec cannot round-trip its own output. */
 #include "../src/imap_codec.h"
@@ -9,7 +10,8 @@
 #include <string.h>
 
 int main(int argc, char **argv) {
-    if (argc != 3) { fprintf(stderr, "usage: xcheck runs.bin streams.bin\n"); return 2; }
+    if (argc != 3 && argc != 4) { fprintf(stderr, "usage: xcheck runs.bin streams.bin [a|b]\n"); return 2; }
+    int order = (argc == 4 && argv[3][0] == 'b') ? IMAP_ORDER_B : IMAP_ORDER_A;
     FILE *f = fopen(argv[1], "rb");
     if (!f) { perror("open runs"); return 2; }
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
@@ -25,11 +27,12 @@ int main(int argc, char **argv) {
     fclose(f);
 
     imap_buf st[IMAP_N_STREAMS];
-    if (imap_encode_chunk(runs, n, st) != 0) { fprintf(stderr, "encode failed\n"); return 1; }
+    if (imap_encode_chunk(runs, n, order, st) != 0) { fprintf(stderr, "encode failed\n"); return 1; }
 
     imap_run *back = malloc((size_t)n * sizeof *back);
-    int64_t b_enter0 = imap_b_enter(runs[0].b, runs[0].len, runs[0].strand);
-    if (imap_decode_chunk(st, n, runs[0].a, b_enter0, back) != 0) {
+    int64_t base_b = order == IMAP_ORDER_A
+                   ? imap_b_enter(runs[0].b, runs[0].len, runs[0].strand) : runs[0].b;
+    if (imap_decode_chunk(st, n, order, runs[0].a, base_b, back) != 0) {
         fprintf(stderr, "decode failed\n"); return 1;
     }
     for (long i = 0; i < n; i++) {

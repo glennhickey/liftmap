@@ -3,12 +3,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <zlib.h>
 
 static uint8_t *slurp(const char *p, long *n) {
     FILE *f=fopen(p,"rb"); if(!f) return NULL;
     fseek(f,0,SEEK_END); *n=ftell(f); fseek(f,0,SEEK_SET);
     uint8_t *b=malloc((size_t)*n); if(fread(b,1,(size_t)*n,f)!=(size_t)*n){free(b);fclose(f);return NULL;}
     fclose(f); return b;
+}
+/* Recompute the header CRC in the trailer, so an edited header reaches the check it is
+ * meant to exercise instead of being stopped by the checksum. */
+static void reseal(uint8_t *b, long n) {
+    uLong c = crc32(crc32(0L, Z_NULL, 0), b, 64);
+    b[n-12] = (uint8_t)c; b[n-11] = (uint8_t)(c >> 8); b[n-10] = (uint8_t)(c >> 16); b[n-9] = (uint8_t)(c >> 24);
 }
 static int opens(const uint8_t *buf, long n) {
     imap_io *io = imap_io_open_mem(buf,n); if(!io) return 0;
@@ -54,10 +61,16 @@ int main(int argc,char**argv){
     CHECK("rejects truncation (trailer only)", !opens(orig,32));
     CHECK("rejects empty", !opens(orig,0));
     { uint8_t *c=malloc((size_t)n); memcpy(c,orig,(size_t)n);
-      c[16]=0x01;                                    /* set an unknown feature bit */
+      c[16]^=0x01;                                   /* flip the order bit, no reseal */
+      CHECK("rejects a flipped header feature bit (header crc)", !opens(c,n)); free(c); }
+    { uint8_t *c=malloc((size_t)n); memcpy(c,orig,(size_t)n);
+      c[24]^=0x20;                                   /* profile byte, no reseal */
+      CHECK("rejects a header profile bit flip (header crc)", !opens(c,n)); free(c); }
+    { uint8_t *c=malloc((size_t)n); memcpy(c,orig,(size_t)n);
+      c[16]|=0x20; reseal(c,n);                      /* an unknown feature bit, sealed */
       CHECK("refuses unknown feature flag", !opens(c,n)); free(c); }
     { uint8_t *c=malloc((size_t)n); memcpy(c,orig,(size_t)n);
-      c[8]=0x09;                                     /* wrong major version */
+      c[8]=0x09; reseal(c,n);                        /* wrong major version, sealed */
       CHECK("refuses wrong major version", !opens(c,n)); free(c); }
 
     free(orig);
