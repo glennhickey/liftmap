@@ -592,6 +592,21 @@ All three checks agree exactly: 846,503,338 runs, 2,245,605,736 bases of forward
 50,889,391 reverse matches. Transcoding took 766 s at 4.8 GB peak, most of it the writer
 holding the ~1.9 GB payload (see the known limit above).
 
+**taffy's `.tui` now runs on this library** (tui format 0.4, taffy.intervalmap `876ab73`),
+checked against the ONEcode build of taffy on the same inputs:
+
+| | rodent | fish subtree |
+|---|---|---|
+| `.tui` size, ONEcode → libintervalmap | 235.5 → 227.8 MB | 1,956 → 1,916 MB |
+| `taffy index -u` wall | 2:46 → 2:40 | 37:50 → 38:11 |
+| open | 7 ms | 72 ms (354,369 chunks, 120,805 sequences) |
+| `view -U`, 30 regions × 3 modes | 90/90 identical, 5.0 → 5.3 s | 90/90 identical, 35.3 → 40.3 s |
+| `lift`, 300 BED intervals × 4 modes | 5 genomes, 20/20 identical | 4 genomes, 16/16 identical |
+
+The fish `view` gap is the open: every directory is parsed at open, ~0.07 s here, which
+repeats per invocation. At 577-way scale that grows to about a second, so loading the chunk
+directories lazily is the next reader change.
+
 Still open, to be measured rather than argued:
 
 1. *(settled: order a for HAL edges, order b for universal columns — table in 1.3)*
