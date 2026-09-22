@@ -76,6 +76,10 @@ int imap_writer_add_run(imap_writer *w, uint32_t a_member, uint32_t b_member,
 
 int imap_writer_set_params(imap_writer *w, uint32_t count, uint64_t bspan, int codec);
 
+/* Application section (SPEC 2.5): id must begin "x." and be unique.  Stored verbatim and
+ * checksummed; the library never interprets it.  Data is copied. */
+int imap_writer_add_section(imap_writer *w, const char *id, const void *data, size_t n);
+
 /* IMAP_ORDER_A (default) or IMAP_ORDER_B.  Only before the first run.  Chunks are cut in
  * axis-a order either way; under order b each chunk is then sorted by (b, a). */
 int imap_writer_set_order(imap_writer *w, int order);
@@ -98,6 +102,18 @@ uint32_t    imap_n_members(const imap_file *f, int axis);
 const imap_member *imap_member_at(const imap_file *f, int axis, uint32_t i);
 int32_t     imap_member_by_name(const imap_file *f, int axis, const char *name);
 const imap_chunk  *imap_chunk_at(const imap_file *f, uint32_t i);
+
+/* Read an application section written with imap_writer_add_section, checksum-verified.
+ * Returns 0 with *out malloc'd (caller frees), 1 if the file has no such section, -1 on
+ * error. */
+int imap_read_section(imap_file *f, const char *id, uint8_t **out, size_t *n);
+
+/* Members whose name begins with `prefix` form a contiguous range in name order:
+ * ranks [*first_rank, *first_rank + *count).  imap_member_by_rank maps a rank to a
+ * member id. */
+int     imap_member_prefix(const imap_file *f, int axis, const char *prefix,
+                           uint32_t *first_rank, uint32_t *count);
+int32_t imap_member_by_rank(const imap_file *f, int axis, uint32_t rank);
 
 /* Decode chunk i into out[], which must hold imap_chunk_at(f,i)->n_runs runs. */
 int imap_read_chunk(imap_file *f, uint32_t i, imap_run *out);

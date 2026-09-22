@@ -1,13 +1,13 @@
 # libintervalmap -- see doc/SPEC.md
 CC      ?= cc
 CFLAGS  ?= -std=c99 -O2 -g -Wall -Wextra
-CPPFLAGS += -D_POSIX_C_SOURCE=200809L
+CPPFLAGS += -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE
 LDLIBS  += -lz
 
 SRC  = src/imap_codec.c src/imap_io.c src/imap_file.c
 OBJ  = $(SRC:.c=.o)
 LIB  = libintervalmap.a
-TESTBINS = bin/xcheck bin/roundtrip bin/robust bin/query bin/fuzz_reader
+TESTBINS = bin/xcheck bin/roundtrip bin/robust bin/query bin/fuzz_reader bin/sections
 
 all: $(LIB) $(TESTBINS)
 

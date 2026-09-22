@@ -382,13 +382,25 @@ per base per column and which degrades to an allocating binary search above 1000
 
 ### 2.5 Optional sections
 
+**Application sections.** Any section whose id begins `x.` belongs to the application: the
+library stores it verbatim, checksums it like every other section, and never interprets it.
+It is loaded only when asked for, so a large one costs nothing at open. Ids are unique; a
+reader refuses a duplicate. This is where profile-specific data lives rather than in the
+library: the `taffy.tui` profile keeps its column count, `max_gap`, source Newick, genome
+roster, and the column → MAF file-offset anchors used by `view -U` as `x.tui.*` sections.
+
+Sections the library itself may define later, not yet implemented:
+
 | id | kind | for |
 |---|---|---|
-| `anchor` | sparse `key → value` map, both monotone, delta+varint | `.tui`'s column → MAF file offset |
 | `group` | `(cluster_id, member, start, len)` records | hal2 paralogy as equivalence classes |
 | `stats` | counts, coverage, run-length and gap histograms | O(1) `halStats` |
 | `prov` | program, version, command, date — one record per writer | provenance |
-| `meta` | free-form `key\tvalue` text | e.g. the `# hal` Newick |
+
+Member names can be looked up by prefix: the members whose name begins with a given string
+form one contiguous range in name order. `.tui` uses this to find all sequences of a genome
+(`"<genome>."`), which is why the prefix must include the separator — `"g1."` must not
+match `g10.chr1`.
 
 ---
 
