@@ -7,7 +7,7 @@ LDLIBS  += -lz
 SRC  = src/imap_codec.c src/imap_io.c src/imap_file.c
 OBJ  = $(SRC:.c=.o)
 LIB  = libintervalmap.a
-TESTBINS = bin/xcheck bin/roundtrip bin/robust
+TESTBINS = bin/xcheck bin/roundtrip bin/robust bin/query bin/fuzz_reader
 
 all: $(LIB) $(TESTBINS)
 

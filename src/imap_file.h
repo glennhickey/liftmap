@@ -17,6 +17,13 @@
 #define IMAP_DIRB_ENTRY   12
 #define IMAP_MEM_ENTRY    40
 
+/* Format limits (SPEC 2.2).  A chunk's decode buffers are sized from its directory
+ * entry, so these, together with the byte-count checks at open, are what stop a few
+ * hundred bytes of hostile file from demanding gigabytes. */
+#define IMAP_MAX_CHUNK_RUNS  (1u << 24)
+#define IMAP_MAX_CHUNK_RAW   (1u << 30)
+#define IMAP_ZLIB_MAX_RATIO  1032u      /* deflate's maximum expansion */
+
 #define IMAP_CODEC_NONE 0
 #define IMAP_CODEC_ZLIB 1
 
@@ -76,5 +83,32 @@ const imap_chunk  *imap_chunk_at(const imap_file *f, uint32_t i);
 
 /* Decode chunk i into out[], which must hold imap_chunk_at(f,i)->n_runs runs. */
 int imap_read_chunk(imap_file *f, uint32_t i, imap_run *out);
+
+/* ------------------------------------------------------------------ queries */
+
+/* One run clipped to a query window. [a, a+len) on axis a of a_member pairs with
+ * [b, b+len) on axis b of b_member; strand 1 pairs a+i with b+len-1-i. */
+typedef struct {
+    uint32_t a_member, b_member;
+    int64_t  a, b, len;
+    uint8_t  strand;
+} imap_hit;
+
+typedef struct {
+    uint32_t chunks_examined;   /* directory entries considered */
+    uint32_t chunks_decoded;    /* chunks actually read and inflated */
+} imap_query_stats;
+
+/* Every run of axis-a member m overlapping [lo,hi) on axis a, clipped to the window.
+ * Results are in axis-a order.  *out is malloc'd; caller frees.  stats may be NULL.
+ * Axis a is a partial function, so results never overlap on axis a. */
+int imap_query_a(imap_file *f, uint32_t m, int64_t lo, int64_t hi,
+                 imap_hit **out, size_t *n, imap_query_stats *stats);
+
+/* Every run of axis-b member m overlapping [lo,hi) on axis b, clipped to the window.
+ * Results are sorted by (b, a_member, a).  Axis b is a multimap, so results may
+ * overlap on axis b -- that is paralogy, and it is reported, not resolved. */
+int imap_query_b(imap_file *f, uint32_t m, int64_t lo, int64_t hi,
+                 imap_hit **out, size_t *n, imap_query_stats *stats);
 
 #endif /* IMAP_FILE_H */

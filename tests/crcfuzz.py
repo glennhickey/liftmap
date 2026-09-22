@@ -6,7 +6,7 @@ mutations before the parsers ever run. With it, ~45% of mutants open and exercis
 directory and chunk decode paths.
 
 usage: crcfuzz.py file.imap iters [seed] [all|tail]
-expects a reader binary ./pocrun taking one .imap path.
+expects ./pocrun: tests/fuzz_reader.c built with -fsanitize=address,undefined.
 """
 import struct, zlib, random, subprocess, sys, os
 

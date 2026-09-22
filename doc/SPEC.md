@@ -203,7 +203,12 @@ scratch; the cost of reserving them now is these two lines.
 
 ### 2.2 Chunk directory `dir.a` — fixed width, uncompressed, binary-searchable
 
-**64 bytes** per chunk, sorted by `(a_member, a_min)`, little-endian, in this order:
+**64 bytes** per chunk, sorted by `(a_member, a_min)`, with the extents of one member's
+chunks disjoint and increasing — which is what makes a binary search over a member's range
+valid. The writer sorts the directory at close (chunks are addressed by payload offset, so
+reordering the directory moves nothing), and requires each axis-a member's runs to arrive
+in non-decreasing `a` without overlap *across* chunks, not merely within one. A reader
+refuses a file where either property fails. Little-endian, in this order:
 
 ```
    0  u32 a_member       4  u32 b_member
@@ -232,6 +237,21 @@ invariant, not a convention** — every skip is silently wrong if a range is loo
 never asserted it. Both are u32: a writer must close a chunk before its extent would exceed
 2^32 rather than let the field wrap, which is the same failure in a quieter form.
 
+**Limits and consistency.** `n_runs` sizes a reader's decode buffer, so it must be
+answerable to the bytes actually present, not merely declared:
+
+- `1 <= n_runs <= 2^24`, and `rawlen <= 2^30`
+- `rawlen >= 16 + 3*n_runs + ceil(n_runs/8)` — every run costs at least one varint byte
+  in each of the a, b and len streams plus a strand bit, after the four-length header
+- `codec 0`: `rawlen == clen`; `codec 1` (zlib): `rawlen <= 1032*clen + 64`, deflate's
+  maximum expansion
+
+Without these a 256-byte chunk could declare two billion runs and a reader would try to
+allocate ~80 GB before discovering the streams are empty — a fuzzer found exactly that.
+
+Every decoded run must lie inside its chunk's declared extents on both axes. That is what
+makes skipping a chunk on its extent sound; a reader rejects a chunk that violates it.
+
 Left uncompressed so it can be `pread` and binary-searched in place. A 1.3 Gb genome at 8192
 runs/chunk is ~3,200 chunks ≈ 205 KB.
 
@@ -245,6 +265,10 @@ runs/chunk is ~3,200 chunks ≈ 205 KB.
 ```
 
 `prefix_max_b_end` is the early-exit bound for the backward walk over overlapping chunks.
+**It resets at each member.** Members are separate coordinate spaces, so a bound carried
+over from the previous member would be meaningless; worse, it would be too large, which
+does not produce wrong answers but silently disables the early exit for the next member.
+A reader recomputes it at open and refuses a file whose stored values differ.
 Storing a permutation rather than a second copy of the runs was measured: a second
 parent-sorted payload costs +2.94 B/run and buys fan-out 1.00 against the cap's 1.48. Not
 worth it.
@@ -259,6 +283,13 @@ worth it.
   name blob
   u32 by_name[n_members]                      member ids, sorted by name
 ```
+
+`first_chunk`/`n_chunks` name a contiguous range **in a directory, not in the payload**:
+for `mem.a` a range of `dir.a` positions, for `mem.b` a range of `dir.b` positions. A
+member's chunks are contiguous in its own axis's directory and generally not in the
+other's — a parent scaffold's chunks are scattered through `dir.a`. Every chunk belongs to
+exactly one range per axis; a reader checks that the ranges tile the directory and that
+each entry in a range carries that member's id.
 
 Extents live here on purpose: omitting them is what costs `.tui` 9 s per query at 577-way
 with no cheap workaround. `by_name` gives O(log n) name lookup with no build-time structure;
@@ -280,6 +311,26 @@ per base per column and which degrades to an allocating binary search above 1000
 | `meta` | free-form `key\tvalue` text | e.g. the `# hal` Newick |
 
 ---
+
+## 2.6 Queries (normative semantics)
+
+A query names one member on one axis and a half-open window `[lo, hi)` on it, and returns
+every run overlapping the window **clipped to it**, with the other axis mapped through the
+run's strand. For a window of offsets `[o1, o2)` into a run of length `len`, the other axis
+gets `[o1, o2)` on the forward strand and `[len-o2, len-o1)` on the reverse strand.
+
+- **axis a** (`query_a`): binary search the member's `dir.a` range for the first chunk whose
+  extent ends after `lo`; scan forward while `a_min < hi`. Results are in `a` order and never
+  overlap, because axis a is a partial function. A point query decodes exactly one chunk.
+- **axis b** (`query_b`): binary search the member's `dir.b` range for the last entry with
+  `b_min < hi`; walk backwards, decoding each chunk whose extent overlaps the window, and
+  stop at the first entry whose `prefix_max_b_end <= lo`. Results are sorted by
+  `(b, a_member, a)`. They may overlap on axis b: that is paralogy, and a query reports it
+  rather than resolving it. Choosing a representative — the smallest `a` among the copies
+  covering a position — is a caller's policy, not the format's.
+
+Measured on the fish edge (9,010,509 runs, 5,575 parent scaffolds), mean chunks decoded per
+query: axis a 1.00 at a 2 bp window, 3.0 at 200 kb; axis b 1.35 at 2 bp, 2.3 at 200 kb.
 
 ## 3. The two profiles
 
