@@ -80,11 +80,15 @@ The point is that a reverse-strand stretch walks *backwards* through axis b. A n
 `b - (prev_b + prev_len)` charges a large negative jump for every run in such a stretch;
 following the traversal direction keeps the delta near zero instead. Measured on the fish
 edge, 48.4% of whose runs are reverse: the b stream drops from 0.838 to 0.497 B/run, and the
-whole file from 2.369 to **1.984 B/run — a 16% saving**. `.tui` does not do this today; it
-instead sorts runs by b within a chunk to get small b deltas, which achieves something
-similar by a more expensive route (and costs it the non-negative a delta). **Whether tui can
-drop its g-sort once it has this delta is an open question worth testing** — if so it loses
-a sort and gains `uvarint` on axis a.
+whole file from 2.369 to **1.984 B/run — a 16% saving**.
+
+**The b delta base must match the run order.** `prev_exit` follows the traversal, which is
+right when runs are in axis-a order. Under `order b` the runs are sorted by b-start, so the
+naive `prev_end` delta is already small and mostly non-negative for both strands, and
+following the traversal instead *breaks* that for reverse runs. Measured on the evolver
+universal-column index, order b: `prev_end` 2.146 B/run, `prev_exit` 2.285. Hence:
+`order a` ⇒ `b delta prev_exit`; `order b` ⇒ `b delta prev_end`. This also settles an earlier
+open question: the strand-aware delta does not let `.tui` drop its within-chunk g-sort.
 
 Encodings: `uvarint` = LEB128 of a non-negative value. `zigzag` = LEB128 of
 `(v << 1) ^ (v >> 63)`. `bitmap` = one bit per run, LSB-first, zero-padded to a byte.
@@ -143,8 +147,24 @@ run.
 genomes with few, long members, where `count` is the only thing closing a chunk.
 **Default 8192**, which bounds bytes inflated per random probe without measurable cost.
 
-`order` is declared, not assumed. `order a` is the default and keeps axis-a deltas
-non-negative; `order b` is what `.tui` does today.
+`order` is declared, not assumed, and **the right choice depends on the data** — measured,
+per-stream zlib-9, `seqbound both`:
+
+| data | order a, `prev_exit` | order b, `prev_end` |
+|---|---|---|
+| HAL edge, fish leaf→ancestor (deep, 48% reverse) | **2.074** | 2.511 |
+| HAL edge, ape internal (shallow) | **2.938** | 3.517 |
+| universal columns, evolver `.tui` (123,471 runs) | 3.097 | **2.098** |
+
+A HAL child→parent map is mostly colinear, so axis-a order keeps b nearly monotone as well,
+and the strand-aware delta absorbs inversions; sorting by b scrambles a instead. On a
+universal column axis one sequence's consecutive runs are separated by every other
+lineage's novel columns, so a-order produces large b jumps that b-order avoids. Hence
+`hal2.edge` is `order a` and `taffy.tui` is `order b`.
+
+Under `order b`, chunks are still *cut* in axis-a order (so `dir.a` extents stay disjoint
+and binary-searchable) and each chunk is then sorted by `(b, a)` internally — the layout
+`.tui` already uses. Axis a is then `zigzag`, and a `query_a` result must be re-sorted.
 
 **Implementation status.** The C writer implements `order a` and `seqbound both` only,
 and encodes axis a as `uvarint`; it rejects a chunk whose extent would not fit the u32
@@ -378,7 +398,7 @@ axis  a  genome  coord seqlocal
 axis  b  column  coord global  extent 72489835721
 
 field a       delta prev_end   enc zigzag
-field b       delta prev_exit  enc zigzag
+field b       delta prev_end   enc zigzag
 field len     delta none       enc uvarint  min 1
 field strand  delta none       enc bitmap
 
@@ -422,13 +442,25 @@ this data in earlier runs, so ~1.93–1.97 B/run is the expected figure.
 
 Per-field round-trip (a, b, len, strand) was checked on every 97th chunk: 0 mismatches.
 
+**Validated against taffy's `.tui` reader** (`tests/imap_transcode.c` in the taffy
+checkout). Every run of `tests/tui/evolverMammals.uni.maf.gz.tui` (16 sequences, 123,471
+runs, T = 708,019 columns) was read with tui's own reader and written through this library:
+
+- run identity: every sequence's runs come back from `query_a` exactly
+- forward lift: `tui_query` vs `query_a`, base by base — 5,041,395 bases over whole sequences
+  plus 30,433,565 over 2,000 random windows, 0 mismatches
+- reverse lift: `tui_genome_lift_column` vs `query_b` over every column and all 9 genomes —
+  5,041,395 matches, 0 mismatches
+
+That transcode was written in `order a`, the only order the writer implements yet, and came
+out 43% larger than the `.tui` (3.12 vs 2.18 B/run) — which is what the order table above
+predicts. **`order b` must be implemented before `.tui` can move onto this library.** With
+it, the reference codec measures 2.098 B/run against tui's 2.151.
+
 Still open, to be measured rather than argued:
 
-1. **`order a` vs `order b` for `hal2.edge`.** `.tui` measured −18% from b-ordering on apes,
-   but that predates the strand-aware delta, which may subsume most of the benefit. Test on a
-   deep and a shallow edge.
-2. **Whether `.tui` can drop its within-chunk g-sort** if it adopts `delta prev_exit`. Same
-   experiment, run against tui's own data.
+1. *(settled: order a for HAL edges, order b for universal columns — table in 1.3)*
+2. *(settled: no — the strand-aware delta hurts under order b)*
 3. **zstd level, and whether a per-section trained dictionary earns its keep.** A dictionary
    measured 2.55 vs 2.57 B/run at 65536 runs but 2.82 vs 3.13 at 256 — it matters only if
    chunks end up small.
