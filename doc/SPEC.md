@@ -53,6 +53,17 @@ section <id> <kind> [args...]         one per section present
 A run is `(a, b, len, strand)`: `[a, a+len)` on axis **a** corresponds to `[b, b+len)` on
 axis **b**, in the orientation given by `strand` (`0` = same, `1` = opposite). On
 `strand = 1`, `a + i` pairs with `b + len-1 - i`.
+Every run lies inside both of its members: `a + len ≤` the axis-a member's length and
+`b + len ≤` the axis-b member's. The writer refuses a run that does not.
+
+**Axis a is a partial function** — each position of an axis-a member maps to at most one
+position on axis b — **unless the header sets feature bit 1 (`A_OVERLAP`)**. That bit exists
+for maps that are approximate by construction: a chained `.tui` merges runs across gaps, so a
+run's length is its span on axis b and no longer its span on axis a, and runs of one sequence
+routinely overlap on it. On the rodent universal index, forcing such a map back to a partial
+function by trimming dropped 3.8M of its 7.8M runs outright. `A_OVERLAP` requires order b,
+because order a stores `a` as an unsigned delta from the previous run's end, which cannot go
+backwards. Axis b is a multimap either way.
 
 | field | stored as | delta base |
 |---|---|---|
@@ -99,7 +110,7 @@ edges the split is 19–22% smaller overall while the strand bitmap costs 0.002 
 
 **Each stream is compressed independently**, not concatenated then compressed, using raw
 deflate (no zlib wrapper: four streams per chunk and ~10^4 chunks per file make the 6-byte
-header and Adler checksum add up, and the section CRC already covers integrity). A stream is
+header and Adler checksum add up, and each chunk's directory CRC covers integrity). A stream is
 deflated only where that makes it smaller; otherwise it is stored verbatim. Measured in the C
 implementation against compressing each chunk as one blob: −1.5% on the fish HAL edge in
 order a, −2.9% in order b, −1.7% on the evolver `.tui` data. Stream order has no measurable
@@ -187,7 +198,7 @@ columns — the role of `.tui`'s `TUI_CHUNK_G_MAX`, which cut a full-chromosome 
 distant target from 196 s to 1.7 s.
 
 **Implementation status.** The C library implements both orders with `seqbound both`,
-recorded in header feature bit 0 (section 2). It rejects a chunk whose extent would not fit
+recorded in header feature bit 0 (section 2), and `A_OVERLAP` (bit 1) under order b. It rejects a chunk whose extent would not fit
 the u32 span fields rather than letting one wrap. Under order b the writer holds one axis-a
 member's runs in memory at a time, which is the same bound `.tui`'s own builder has.
 
@@ -206,10 +217,12 @@ Little-endian throughout. Sections are 8-byte aligned.
 ```
 HEADER  (64 B, at offset 0 — sized so format sniffers that read 64 bytes see all of it)
   0   u8[8]   magic  = "IMAP\x1A\x0D\x0A\x00"
-  8   u32     imap_major         3; a reader requires an exact match
+  8   u32     imap_major         4; a reader requires an exact match
   12  u32     imap_minor         0
   16  u64     feature_flags      unknown bit set => reader MUST refuse
                                  bit 0: runs within a chunk are in order b
+                                 bit 1: A_OVERLAP -- axis a may overlap (1.2);
+                                        only with bit 0
   24  u8[32]  profile            NUL-padded, e.g. "hal2.edge"
   56  u64     reserved (0)
 
@@ -233,7 +246,13 @@ real order-a file made the reader open it as order b: the per-run containment ch
 rejected 11,199 of its 11,218 chunks, and the other 19 decoded without complaint into
 different runs.
 
-Open = `pread` the last 32 B, then `pread` the footer. Nothing else is read until queried.
+Open = `pread` the last 32 B, then `pread` the footer, then the directory sections. **The
+`runs` section is not read at open**: it is the one section whose size scales with the
+data, and an index is opened to touch a few chunks. Each chunk carries its own CRC in its
+directory entry, checked whenever the chunk is read. The `runs` section's own CRC in the
+section table is checked only by a full verification pass (`imap_verify`, which streams it
+in bounded reads). An earlier version read and checksummed the whole payload at open, which
+cost 175 ms per open on the 228 MB rodent index; opening now takes 7 ms.
 
 ### 2.1 Section table
 
@@ -256,12 +275,12 @@ scratch; the cost of reserving them now is these two lines.
 
 ### 2.2 Chunk directory `dir.a` — fixed width, uncompressed, binary-searchable
 
-**64 bytes** per chunk, sorted by `(a_member, a_min)`. Under `order a` a member's chunks are
+**72 bytes** per chunk, sorted by `(a_member, a_min)`. Under `order a` a member's chunks are
 also disjoint on axis a, since they were cut along it; under `order b` they generally
 overlap. The writer sorts the directory at close (chunks are addressed by payload offset, so
 reordering the directory moves nothing), and requires each axis-a member's runs to arrive in
 non-decreasing `a` without overlap *across* chunks, not merely within one — axis a is a
-partial function at the level of runs whatever the chunk layout. Little-endian, in this
+partial function at the level of runs whatever the chunk layout (unless `A_OVERLAP`, 1.2). Little-endian, in this
 order:
 
 ```
@@ -271,6 +290,8 @@ order:
   32  u64 base          <- decode base of the NON-ordering axis (below)
   40  u64 off           <- relative to the start of the `runs` section
   48  u32 clen          52  u32 rawlen     56  u32 n_runs     60  u32 codec
+  64  u32 crc32         <- CRC-32 of the chunk's clen stored bytes
+  68  u32 reserved (0)
 ```
 
 Decoding a chunk needs the first run's position on both axes. The first run in stored order
@@ -413,8 +434,9 @@ gets `[o1, o2)` on the forward strand and `[len-o2, len-o1)` on the reverse stra
 
 - **axis a** (`query_a`): binary search the member's `dir.a` range for the last entry with
   `a_min < hi`; walk backwards, decoding each chunk whose extent overlaps the window, and stop
-  at the first entry whose `dir.a.max <= lo`. Results are sorted by `a` and never overlap,
-  because axis a is a partial function. Under order a a point query decodes exactly one
+  at the first entry whose `dir.a.max <= lo`. Results are sorted by `(a, b, len, strand)`
+  and never overlap, because axis a is a partial function — unless the file sets
+  `A_OVERLAP`, when they may. Under order a a point query decodes exactly one
   chunk; under order b it decodes the few whose axis-a extents overlap (4.3 on average on the
   fish edge, against 1.18 for an axis-b point query — the trade order b makes).
 - **axis b** (`query_b`): binary search the member's `dir.b` range for the last entry with
@@ -494,6 +516,13 @@ No `mem.b` — axis b is `global`, so it has one implicit member of size `extent
 and `count 65536` preserve today's `.tui` behaviour; `seqbound a` only, since axis b has no
 members to bound against. The `# hal` Newick and `max_gap` live in `meta`.
 
+As implemented in taffy (tui format 0.4) the column axis is an explicit `mem.b` with one
+member, `column`, of length T, and the tui-specific data is application sections (2.5):
+`x.tui.meta` (`key\tvalue` lines: format, T, max_gap, anchor count, provenance),
+`x.tui.tree` (the Newick), `x.tui.roster` (genome, total bp, sequence count) and
+`x.tui.anchor` (the column → file-offset index). A chained index (`max_gap > 0`) sets
+`A_OVERLAP`; a base index does not.
+
 That is the whole difference between the two formats: **axis declarations, run order, chunk
 constants, and which optional sections are present.**
 
@@ -518,7 +547,7 @@ this data in earlier runs, so ~1.93–1.97 B/run is the expected figure.
 Per-field round-trip (a, b, len, strand) was checked on every 97th chunk: 0 mismatches.
 
 **Validated against taffy's `.tui` reader** (`tests/imap_transcode.c` in the taffy
-checkout). Every run of `tests/tui/evolverMammals.uni.maf.gz.tui` (16 sequences, 123,471
+checkout, up to commit 09ced8e; retired once `.tui` itself moved onto this library, below). Every run of `tests/tui/evolverMammals.uni.maf.gz.tui` (16 sequences, 123,471
 runs, T = 708,019 columns) was read with tui's own reader and written through this library:
 
 - run identity: every sequence's runs come back from `query_a` exactly

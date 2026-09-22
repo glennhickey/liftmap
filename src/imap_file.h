@@ -13,7 +13,7 @@
 #define IMAP_MAGIC        "IMAP\x1A\x0D\x0A"   /* 7 chars + implicit NUL = 8 bytes */
 #define IMAP_HEADER_SIZE  64
 #define IMAP_TRAILER_SIZE 32
-#define IMAP_DIRA_ENTRY   64
+#define IMAP_DIRA_ENTRY   72
 #define IMAP_DIRB_ENTRY   12
 #define IMAP_MEM_ENTRY    40
 
@@ -27,7 +27,8 @@
 /* Header feature flags (SPEC 2).  A reader refuses any bit it does not know, so a
  * file using a newer feature is rejected by an older reader, never misread. */
 #define IMAP_FEAT_ORDER_B   (1ull << 0)     /* runs within a chunk are in order b */
-#define IMAP_FEAT_KNOWN     (IMAP_FEAT_ORDER_B)
+#define IMAP_FEAT_A_OVERLAP (1ull << 1)     /* axis a may overlap (order b only; SPEC 1.2) */
+#define IMAP_FEAT_KNOWN     (IMAP_FEAT_ORDER_B | IMAP_FEAT_A_OVERLAP)
 
 /* Chunk codecs (SPEC 2.2).  A chunk's four streams are compressed independently. */
 #define IMAP_CODEC_NONE     0     /* every stream stored verbatim */
@@ -35,7 +36,7 @@
 
 /* On-disk format version.  There is no reader for earlier drafts: a file written
  * before a bump must be regenerated (the .tui policy). */
-#define IMAP_FORMAT_MAJOR 3
+#define IMAP_FORMAT_MAJOR 4
 
 /* One chunk's directory entry, in memory (native types; serialized explicitly). */
 typedef struct {
@@ -49,6 +50,7 @@ typedef struct {
     uint64_t off;               /* within the runs section */
     uint32_t clen, rawlen, n_runs;
     uint32_t codec;            /* IMAP_CODEC_* for this chunk's blob */
+    uint32_t crc;              /* CRC-32 of the chunk's clen stored bytes, checked on read */
 } imap_chunk;
 
 /* One member (sequence) of an axis. */
@@ -69,8 +71,10 @@ imap_writer *imap_writer_open(const char *path, const char *profile, const char 
 /* Members must be declared before any run referencing them. Returns member id. */
 int32_t imap_writer_add_member(imap_writer *w, int axis, const char *name, uint64_t length);
 
-/* Runs must arrive in axis-a order within a member. The writer closes chunks per
- * SPEC S1.3 (count / bspan / member change) and never lets a chunk span members. */
+/* Runs must arrive in axis-a order within a member, without overlap (unless
+ * imap_writer_set_a_overlap), and lie inside both members' lengths; a violating run returns -1 and fails the writer.  The writer
+ * closes chunks per SPEC S1.3 (count / bspan / member change) and never lets a chunk
+ * span members. */
 int imap_writer_add_run(imap_writer *w, uint32_t a_member, uint32_t b_member,
                         int64_t a, int64_t b, int64_t len, uint8_t strand);
 
@@ -80,9 +84,16 @@ int imap_writer_set_params(imap_writer *w, uint32_t count, uint64_t bspan, int c
  * checksummed; the library never interprets it.  Data is copied. */
 int imap_writer_add_section(imap_writer *w, const char *id, const void *data, size_t n);
 
-/* IMAP_ORDER_A (default) or IMAP_ORDER_B.  Only before the first run.  Chunks are cut in
- * axis-a order either way; under order b each chunk is then sorted by (b, a). */
+/* IMAP_ORDER_A (default) or IMAP_ORDER_B.  Only before the first run.  Under order b the
+ * writer buffers each axis-a member's runs, sorts them by (b_member, b, a) and cuts
+ * chunks along axis b (SPEC S1.3); runs still arrive in axis-a order per member. */
 int imap_writer_set_order(imap_writer *w, int order);
+
+/* Declare that runs of one axis-a member may overlap on axis a (SPEC 1.2), for maps that
+ * are approximate by construction -- e.g. runs merged across gaps, whose lengths no longer
+ * match on both axes.  Recorded in the header so readers know axis a is not a partial
+ * function.  Requires order b (set it first), and only before the first run. */
+int imap_writer_set_a_overlap(imap_writer *w);
 int imap_writer_close(imap_writer *w);          /* writes footer+trailer, frees */
 void imap_writer_abort(imap_writer *w);
 
@@ -97,6 +108,7 @@ void       imap_close(imap_file *f);
 const char *imap_profile(const imap_file *f);
 const char *imap_schema_text(const imap_file *f);
 int         imap_order(const imap_file *f);          /* IMAP_ORDER_A or IMAP_ORDER_B */
+int         imap_a_overlap(const imap_file *f);      /* 1 if axis a may overlap */
 uint32_t    imap_n_chunks(const imap_file *f);
 uint32_t    imap_n_members(const imap_file *f, int axis);
 const imap_member *imap_member_at(const imap_file *f, int axis, uint32_t i);
@@ -115,8 +127,14 @@ int     imap_member_prefix(const imap_file *f, int axis, const char *prefix,
                            uint32_t *first_rank, uint32_t *count);
 int32_t imap_member_by_rank(const imap_file *f, int axis, uint32_t rank);
 
-/* Decode chunk i into out[], which must hold imap_chunk_at(f,i)->n_runs runs. */
+/* Decode chunk i into out[], which must hold imap_chunk_at(f,i)->n_runs runs.  The
+ * chunk's bytes are checked against its directory CRC first; -1 on any mismatch. */
 int imap_read_chunk(imap_file *f, uint32_t i, imap_run *out);
+
+/* Full integrity check: the runs section's CRC, streamed in bounded reads, and every
+ * chunk's own CRC.  Open does not read the payload -- it is the one section whose size
+ * scales with the data -- so this is the way to check a whole file.  0 if intact. */
+int imap_verify(imap_file *f);
 
 /* ------------------------------------------------------------------ queries */
 
@@ -134,8 +152,9 @@ typedef struct {
 } imap_query_stats;
 
 /* Every run of axis-a member m overlapping [lo,hi) on axis a, clipped to the window.
- * Results are in axis-a order.  *out is malloc'd; caller frees.  stats may be NULL.
- * Axis a is a partial function, so results never overlap on axis a. */
+ * Results are sorted by (a, b, len).  *out is malloc'd; caller frees.  stats may be NULL.
+ * Axis a is a partial function, so results never overlap on axis a -- unless the file
+ * declares IMAP_FEAT_A_OVERLAP (imap_a_overlap). */
 int imap_query_a(imap_file *f, uint32_t m, int64_t lo, int64_t hi,
                  imap_hit **out, size_t *n, imap_query_stats *stats);
 

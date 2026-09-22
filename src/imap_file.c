@@ -1,4 +1,8 @@
 /* imap_file -- see imap_file.h and doc/SPEC.md S2. */
+/* POSIX.1-2008 for pread/strdup/fstat, whatever -std= the embedding build uses. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "imap_file.h"
 
 #include <stdio.h>
@@ -98,7 +102,7 @@ typedef struct {
 struct imap_writer {
     FILE    *fp;
     char    *path, *profile, *schema;
-    uint32_t count;  uint64_t bspan;  int codec;  int order;
+    uint32_t count;  uint64_t bspan;  int codec;  int order;  int a_overlap;
 
     wmember *mem[2];  uint32_t n_mem[2], cap_mem[2];
 
@@ -130,17 +134,29 @@ imap_writer *imap_writer_open(const char *path, const char *profile, const char 
     return w;
 }
 
+static int writer_has_runs(const imap_writer *w);
+
 int imap_writer_set_params(imap_writer *w, uint32_t count, uint64_t bspan, int codec) {
-    if (!w || w->n_chunks || w->n_pend) return -1;      /* only before any run */
+    if (!w || writer_has_runs(w)) return -1;            /* only before any run */
     if (count == 0 || count > IMAP_MAX_CHUNK_RUNS) return -1;
     if (codec != IMAP_CODEC_NONE && codec != IMAP_CODEC_DEFLATE) return -1;
     w->count = count; w->bspan = bspan; w->codec = codec; return 0;
 }
 
+static int writer_has_runs(const imap_writer *w) { return w->n_chunks || w->n_pend || w->n_bbuf; }
+
 int imap_writer_set_order(imap_writer *w, int order) {
-    if (!w || w->n_chunks || w->n_pend) return -1;      /* only before any run */
+    if (!w || writer_has_runs(w)) return -1;            /* only before any run */
     if (order != IMAP_ORDER_A && order != IMAP_ORDER_B) return -1;
+    if (w->a_overlap && order != IMAP_ORDER_B) return -1;
     w->order = order; return 0;
+}
+
+int imap_writer_set_a_overlap(imap_writer *w) {
+    /* Order a stores a as an unsigned delta from the previous run's end, which cannot
+     * go backwards; order b stores it zigzag against the previous run's start. */
+    if (!w || writer_has_runs(w) || w->order != IMAP_ORDER_B) return -1;
+    w->a_overlap = 1; return 0;
 }
 
 int imap_writer_add_section(imap_writer *w, const char *id, const void *data, size_t n) {
@@ -249,6 +265,7 @@ static int emit_chunk(imap_writer *w, const imap_run *runs, uint32_t n, uint32_t
     c->rawlen = rawlen32;
     c->n_runs = n;
     c->codec = (uint32_t)w->codec;
+    c->crc = crc_all(body, bodylen);
 
     int rc = vec_put(&w->runs, body, bodylen);
     vec_free(&blob);
@@ -271,7 +288,11 @@ static int cmp_brun(const void *x, const void *y) {
     const struct brun *p = (const struct brun *)x, *q = (const struct brun *)y;
     if (p->bm != q->bm) return p->bm < q->bm ? -1 : 1;
     if (p->r.b != q->r.b) return p->r.b < q->r.b ? -1 : 1;
-    return (p->r.a > q->r.a) - (p->r.a < q->r.a);       /* a unique within a member */
+    if (p->r.a != q->r.a) return p->r.a < q->r.a ? -1 : 1;
+    /* (b, a) is unique within a member unless axis a may overlap; keep that case
+     * deterministic */
+    if (p->r.len != q->r.len) return p->r.len < q->r.len ? -1 : 1;
+    return (int)p->r.strand - (int)q->r.strand;
 }
 
 /* Order b (SPEC 1.3): a whole axis-a member is buffered, sorted by (b_member, b, a), and
@@ -315,12 +336,17 @@ int imap_writer_add_run(imap_writer *w, uint32_t a_member, uint32_t b_member,
     if (a < 0 || b < 0 || len < 1) return -1;
     if (a_member >= w->n_mem[0] || b_member >= w->n_mem[1]) return -1;
     if (len > INT64_MAX - a || len > INT64_MAX - b) return -1;
+    /* A run must lie inside both members (SPEC 1.2).  The reader rejects a chunk
+     * whose extent passes its member's end, so accepting one here would write a
+     * file that cannot be opened. */
+    if ((uint64_t)(a + len) > w->mem[0][a_member].length ||
+        (uint64_t)(b + len) > w->mem[1][b_member].length) return -1;
 
     /* Axis a is a partial function (SPEC 1.2): a member's runs must not overlap or
      * go backwards, and that has to hold across chunks, not just inside one --
      * otherwise two chunks of the same member can claim the same bases. */
     wmember *am = &w->mem[0][a_member];
-    if (am->has_runs && a < am->last_a_exit) { w->failed = 1; return -1; }
+    if (am->has_runs && a < am->last_a_exit && !w->a_overlap) { w->failed = 1; return -1; }
 
     if (w->order == IMAP_ORDER_B) {
         if (w->n_bbuf && a_member != w->bbuf_amem) {
@@ -477,7 +503,8 @@ int imap_writer_close(imap_writer *w) {
             vec_put32(&dira, c->b_span) || vec_put64(&dira, c->b_min) ||
             vec_put64(&dira, c->base) || vec_put64(&dira, c->off) ||
             vec_put32(&dira, c->clen) || vec_put32(&dira, c->rawlen) ||
-            vec_put32(&dira, c->n_runs) || vec_put32(&dira, c->codec)) goto done;
+            vec_put32(&dira, c->n_runs) || vec_put32(&dira, c->codec) ||
+            vec_put32(&dira, c->crc) || vec_put32(&dira, 0)) goto done;
     }
     {
         /* dir.b: chunk ids sorted by (b_member, b_min), with a running max of b_end
@@ -518,7 +545,8 @@ int imap_writer_close(imap_writer *w) {
         memset(hdr, 0, sizeof hdr);
         memcpy(hdr, IMAP_MAGIC, 8);
         st32(hdr + 8, IMAP_FORMAT_MAJOR); st32(hdr + 12, 0);
-        st64(hdr + 16, w->order == IMAP_ORDER_B ? IMAP_FEAT_ORDER_B : 0);
+        st64(hdr + 16, (w->order == IMAP_ORDER_B ? IMAP_FEAT_ORDER_B : 0) |
+                       (w->a_overlap ? IMAP_FEAT_A_OVERLAP : 0));
         strncpy((char *)hdr + 24, w->profile, 31);
         hdr_crc = crc_all(hdr, sizeof hdr);
         if (write_all(w->fp, hdr, sizeof hdr) != 0) goto done;
@@ -620,13 +648,13 @@ struct imap_file {
     imap_io *io; int own_io;
     char profile[32];
     char *schema;
-    int order;
+    int order, a_overlap;
     imap_chunk *chunks; uint32_t n_chunks;
     uint32_t *dirb_id; uint64_t *dirb_max;
     uint64_t *dira_max;
     imap_member *mem[2]; uint32_t n_mem[2];
     uint32_t *by_name[2];
-    uint64_t runs_off, runs_len;
+    uint64_t runs_off, runs_len; uint32_t runs_crc;
     struct xent { char *id; uint64_t off, len; uint32_t crc; } *xs; uint32_t n_xs;
 };
 
@@ -692,6 +720,8 @@ imap_file *imap_open_io(imap_io *io, int own_io) {
     uint64_t feat = ld64(hdr + 16);
     if (feat & ~IMAP_FEAT_KNOWN) goto fail;                 /* a feature we don't know */
     f->order = (feat & IMAP_FEAT_ORDER_B) ? IMAP_ORDER_B : IMAP_ORDER_A;
+    f->a_overlap = (feat & IMAP_FEAT_A_OVERLAP) ? 1 : 0;
+    if (f->a_overlap && f->order != IMAP_ORDER_B) goto fail;   /* not encodable in order a */
     memcpy(f->profile, hdr + 24, 31); f->profile[31] = 0;
     uint64_t foff = ld64(tr), flen = ld64(tr + 8);
     if (foff < IMAP_HEADER_SIZE || flen > (uint64_t)sz || foff > (uint64_t)sz - flen) goto fail;
@@ -732,12 +762,10 @@ imap_file *imap_open_io(imap_io *io, int own_io) {
         else if (!strcmp(id, "runs")) {
             if (seen_runs) goto footfail;         /* duplicate ids are not legal */
             seen_runs = 1;
-            uint8_t *body = NULL;                 /* verify the payload's checksum too */
-            if (read_section_body(io, so, sl, &body) != 0) goto footfail;
-            int bad = (crc_all(body, sl) != scrc);
-            free(body);
-            if (bad) goto footfail;
-            f->runs_off = so; f->runs_len = sl;
+            /* Not read here: the payload is the one section that scales with the data,
+             * and an index is opened to touch a few chunks.  Each chunk carries its own
+             * CRC, checked on read; imap_verify checks this section's. */
+            f->runs_off = so; f->runs_len = sl; f->runs_crc = scrc;
             continue;
         }
         else if (!strcmp(id, "schema")) {
@@ -782,7 +810,9 @@ imap_file *imap_open_io(imap_io *io, int own_io) {
         c->base     = ld64(e + 32); c->off      = ld64(e + 40);
         c->clen     = ld32(e + 48); c->rawlen   = ld32(e + 52);
         c->n_runs   = ld32(e + 56); c->codec = ld32(e + 60);
+        c->crc      = ld32(e + 64);
         if (c->codec != IMAP_CODEC_NONE && c->codec != IMAP_CODEC_DEFLATE) goto tablefail;
+        if (ld32(e + 68) != 0) goto tablefail;              /* reserved */
         /* n_runs sizes the decode buffer, so it must be answerable to the bytes that
          * are actually there: every run costs at least one varint byte in each of the
          * a, b and len streams plus a strand bit, after the 16-byte stream header.
@@ -914,6 +944,7 @@ void imap_close(imap_file *f) {
 const char *imap_profile(const imap_file *f)     { return f ? f->profile : NULL; }
 const char *imap_schema_text(const imap_file *f) { return f ? f->schema : NULL; }
 int         imap_order(const imap_file *f)       { return f ? f->order : -1; }
+int         imap_a_overlap(const imap_file *f)   { return f ? f->a_overlap : 0; }
 uint32_t    imap_n_chunks(const imap_file *f)    { return f ? f->n_chunks : 0; }
 uint32_t    imap_n_members(const imap_file *f, int axis) {
     return (f && (axis == 0 || axis == 1)) ? f->n_mem[axis] : 0;
@@ -961,7 +992,8 @@ int imap_read_chunk(imap_file *f, uint32_t i, imap_run *out) {
     if (!c || !out || c->clen < 32) return -1;
     uint8_t *raw = malloc(c->clen);
     if (!raw) return -1;
-    if (imap_pread(f->io, raw, (int64_t)(f->runs_off + c->off), (int64_t)c->clen) != 0) {
+    if (imap_pread(f->io, raw, (int64_t)(f->runs_off + c->off), (int64_t)c->clen) != 0 ||
+        crc_all(raw, c->clen) != c->crc) {
         free(raw); return -1;
     }
     /* Blob (SPEC 2.2): u32 raw_len[4], u32 stored_len[4], the four stored streams.
@@ -1048,7 +1080,12 @@ static int scan_chunk(imap_file *f, uint32_t ci, int axis, int64_t lo, int64_t h
 
 static int cmp_hit_a(const void *x, const void *y) {
     const imap_hit *p = (const imap_hit *)x, *q = (const imap_hit *)y;
-    return (p->a > q->a) - (p->a < q->a);
+    /* a alone is unique unless the file declares A_OVERLAP; the rest keeps that case
+     * deterministic */
+    if (p->a != q->a) return p->a < q->a ? -1 : 1;
+    if (p->b != q->b) return p->b < q->b ? -1 : 1;
+    if (p->len != q->len) return p->len < q->len ? -1 : 1;
+    return (int)p->strand - (int)q->strand;
 }
 
 int imap_query_a(imap_file *f, uint32_t m, int64_t lo, int64_t hi,
@@ -1078,7 +1115,7 @@ int imap_query_a(imap_file *f, uint32_t m, int64_t lo, int64_t hi,
     }
     free(buf);
     if (rc != 0) { free(v.p); return -1; }
-    if (v.n > 1) qsort(v.p, v.n, sizeof *v.p, cmp_hit_a);   /* a is unique within a member */
+    if (v.n > 1) qsort(v.p, v.n, sizeof *v.p, cmp_hit_a);
     *out = v.p; *n = v.n;
     return 0;
 }
@@ -1125,6 +1162,32 @@ int imap_query_b(imap_file *f, uint32_t m, int64_t lo, int64_t hi,
 }
 
 /* ============================================= APPLICATION SECTIONS, NAME RANGES */
+
+int imap_verify(imap_file *f) {
+    if (!f) return -1;
+    enum { STEP = 1 << 20 };
+    uint8_t *buf = malloc(STEP);
+    if (!buf) return -1;
+    uLong crc = crc32(0L, Z_NULL, 0);
+    for (uint64_t done = 0; done < f->runs_len; ) {
+        uint64_t k = f->runs_len - done < STEP ? f->runs_len - done : STEP;
+        if (imap_pread(f->io, buf, (int64_t)(f->runs_off + done), (int64_t)k) != 0) { free(buf); return -1; }
+        crc = crc32(crc, buf, (uInt)k);
+        done += k;
+    }
+    free(buf);
+    if ((uint32_t)crc != f->runs_crc) return -1;
+    for (uint32_t i = 0; i < f->n_chunks; i++) {
+        const imap_chunk *c = &f->chunks[i];
+        uint8_t *raw = malloc(c->clen);
+        if (!raw) return -1;
+        int bad = imap_pread(f->io, raw, (int64_t)(f->runs_off + c->off), (int64_t)c->clen) != 0 ||
+                  crc_all(raw, c->clen) != c->crc;
+        free(raw);
+        if (bad) return -1;
+    }
+    return 0;
+}
 
 int imap_read_section(imap_file *f, const char *id, uint8_t **out, size_t *n) {
     if (!f || !id || !out || !n) return -1;

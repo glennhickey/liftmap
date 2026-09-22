@@ -27,6 +27,16 @@ def repair(buf):
     b=bytearray(buf); n=len(b)
     try: foff,flen,secs=parse(bytes(b))
     except Exception: return None
+    # chunk CRCs first (they live in dir.a, whose section CRC is repaired below):
+    # 72-byte entries, off u64 at 40, clen u32 at 48, crc u32 at 64
+    sd={sid:(so,sl) for sid,so,sl,crcpos in secs}
+    if 'runs' in sd and 'dir.a' in sd:
+        rso,rsl=sd['runs']; dso,dsl=sd['dir.a']
+        if dso+dsl>n: return None
+        for e in range(dso, dso+dsl-71, 72):
+            off,=struct.unpack_from('<Q',b,e+40); clen,=struct.unpack_from('<I',b,e+48)
+            if rso+off+clen<=n:
+                struct.pack_into('<I',b,e+64, zlib.crc32(bytes(b[rso+off:rso+off+clen])) & 0xffffffff)
     for sid,so,sl,crcpos in secs:
         if so+sl>n: return None
         struct.pack_into('<I',b,crcpos, zlib.crc32(bytes(b[so:so+sl])) & 0xffffffff)

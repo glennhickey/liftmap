@@ -1,3 +1,7 @@
+/* POSIX.1-2008 for pread/strdup/fstat, whatever -std= the embedding build uses. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "imap_io.h"
 
 #include <errno.h>

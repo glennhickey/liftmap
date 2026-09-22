@@ -70,6 +70,44 @@ int main(int argc, char **argv) {
     CHECK("an intact section still reads", f && imap_read_section(f, "x.tui.meta", &p, &n) == 0);
     if (f) { free(p); imap_close(f); }
 
+    /* writer contract: runs must lie inside both members and not overlap on axis a */
+    printf("run contract:\n");
+    w = imap_writer_open(path, "test", "imap 1\n");
+    imap_writer_add_member(w, 0, "s", 100);
+    imap_writer_add_member(w, 1, "column", 1000);
+    CHECK("refuses a run past the axis-a member end", imap_writer_add_run(w, 0, 0, 95, 0, 10, 0) != 0);
+    CHECK("refuses a run past the axis-b member end", imap_writer_add_run(w, 0, 0, 0, 995, 10, 1) != 0);
+    CHECK("accepts a run ending exactly at both ends", imap_writer_add_run(w, 0, 0, 90, 990, 10, 0) == 0);
+    CHECK("refuses a run overlapping the last on axis a", imap_writer_add_run(w, 0, 0, 95, 0, 1, 0) != 0);
+    imap_writer_abort(w);
+
+    /* A_OVERLAP: axis a may overlap, order b only */
+    printf("axis-a overlap:\n");
+    w = imap_writer_open(path, "test", "imap 1\n");
+    CHECK("refused under order a",  imap_writer_set_a_overlap(w) != 0);
+    imap_writer_set_order(w, IMAP_ORDER_B);
+    CHECK("accepted under order b", imap_writer_set_a_overlap(w) == 0);
+    CHECK("order a is then refused", imap_writer_set_order(w, IMAP_ORDER_A) != 0);
+    imap_writer_add_member(w, 0, "s", 100);
+    imap_writer_add_member(w, 1, "column", 1000);
+    CHECK("an overlapping run is accepted",
+          imap_writer_add_run(w, 0, 0, 10, 500, 20, 0) == 0 &&
+          imap_writer_add_run(w, 0, 0, 15, 100, 10, 1) == 0 &&
+          imap_writer_add_run(w, 0, 0,  5, 800, 3, 0) == 0);
+    CHECK("closes", imap_writer_close(w) == 0);
+    f = imap_open(path);
+    CHECK("reopens and reports the overlap", f && imap_a_overlap(f) == 1);
+    imap_hit *hh = NULL; size_t hn = 0;
+    CHECK("query_a returns every overlapping run, sorted by (a, b)",
+          f && imap_query_a(f, 0, 0, 100, &hh, &hn, NULL) == 0 && hn == 3 &&
+          hh[0].a == 5 && hh[1].a == 10 && hh[1].b == 500 && hh[2].a == 15 && hh[2].strand == 1);
+    free(hh);
+    CHECK("query_a at a doubly-covered base returns both",
+          f && imap_query_a(f, 0, 17, 18, &hh, &hn, NULL) == 0 && hn == 2 &&
+          hh[0].b == 107 && hh[1].b == 507);   /* tie on a: by b */
+    free(hh);
+    if (f) imap_close(f);
+
     printf("%s (%d failures)\n", fails ? "FAILURES" : "ALL PASS", fails);
     return fails ? 1 : 0;
 }

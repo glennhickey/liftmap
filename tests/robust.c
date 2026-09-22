@@ -73,6 +73,31 @@ int main(int argc,char**argv){
       c[8]=0x09; reseal(c,n);                        /* wrong major version, sealed */
       CHECK("refuses wrong major version", !opens(c,n)); free(c); }
 
+    { /* The payload is not read at open (it scales with the data); each chunk is
+       * checked on read against its directory CRC, and imap_verify checks it all.
+       * The middle byte of a real file lies in the runs section, which dominates. */
+      uint8_t *c=malloc((size_t)n); memcpy(c,orig,(size_t)n); c[n/2]^=0x10;
+      imap_io *io = imap_io_open_mem(c,n);
+      imap_file *f = io ? imap_open_io(io,0) : NULL;
+      CHECK("a payload bit flip still opens (payload is not read at open)", f != NULL);
+      CHECK("imap_verify reports the payload bit flip", f && imap_verify(f) != 0);
+      uint32_t failed = 0;
+      for (uint32_t i = 0; f && i < imap_n_chunks(f); i++) {
+          const imap_chunk *ch = imap_chunk_at(f,i);
+          imap_run *r = malloc((size_t)ch->n_runs * sizeof *r);
+          if (!r || imap_read_chunk(f,i,r) != 0) failed++;
+          free(r);
+      }
+      CHECK("exactly one chunk refuses to read (its CRC)", failed == 1);
+      if (f) imap_close(f);
+      if (io) imap_io_close(io);
+      free(c); }
+    { imap_io *io = imap_io_open_mem(orig,n);
+      imap_file *f = io ? imap_open_io(io,0) : NULL;
+      CHECK("imap_verify passes the intact file", f && imap_verify(f) == 0);
+      if (f) imap_close(f);
+      if (io) imap_io_close(io); }
+
     free(orig);
     printf("%s (%d failures)\n", fails?"FAILURES":"ALL PASS", fails);
     return fails?1:0;
