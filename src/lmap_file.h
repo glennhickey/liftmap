@@ -193,6 +193,53 @@ int lmap_query_a(lmap_file *f, uint32_t m, int64_t lo, int64_t hi,
 int lmap_query_b(lmap_file *f, uint32_t m, int64_t lo, int64_t hi,
                  lmap_hit **out, size_t *n, lmap_query_stats *stats);
 
+/* ------------------------------------------------------------------ builder
+ *
+ * A front end to the writer for runs that arrive in any order.  Runs may repeat, overlap,
+ * or split one colinear stretch into pieces: at close they are reduced to the canonical
+ * form of the aligned base-pair set -- maximal runs, unioned along each diagonal -- so the
+ * same base pairs always give the same file.  Each axis-a member's runs are then sorted
+ * on a and the storage order chosen: as set (default order a), except that if axis a
+ * overlaps the file is written in order b with LMAP_FEAT_A_OVERLAP, or close fails if
+ * overlap was not allowed.
+ *
+ * Memory: runs are held up to mem_bytes (0 = 1 GiB), then spilled as sorted segments to
+ * a temporary file in tmp_dir (NULL = the output's directory).  The file is unlinked on
+ * creation, so nothing is left behind even on a crash.  Close holds one axis-a member's
+ * runs at a time.
+ *
+ * Members are declared through the builder (it checks runs against their lengths).
+ * Metadata, groups, sections and chunk parameters go straight to the underlying writer,
+ * lmap_builder_writer(b); do not add members, runs, or set the order on it directly. */
+
+#define LMAP_ORDER_AUTO (-1)
+
+typedef struct lmap_builder lmap_builder;
+
+typedef struct {
+    uint64_t input_runs;          /* as added */
+    uint64_t runs;                /* canonical, as written */
+    uint64_t overlapping_runs;    /* runs overlapping an earlier one of their member on a */
+    uint32_t spill_segments;
+    int      order;               /* the order written */
+    char     error[512];          /* why close failed, "" on success */
+} lmap_build_stats;
+
+lmap_builder *lmap_builder_open(const char *path, const char *profile,
+                                size_t mem_bytes, const char *tmp_dir);
+lmap_writer  *lmap_builder_writer(lmap_builder *b);
+int32_t lmap_builder_add_member(lmap_builder *b, int axis, const char *name, uint64_t length);
+int     lmap_builder_add_run(lmap_builder *b, uint32_t a_member, uint32_t b_member,
+                             int64_t a, int64_t bpos, int64_t len, uint8_t strand);
+int     lmap_builder_set_order(lmap_builder *b, int order);   /* LMAP_ORDER_A/B/AUTO */
+int     lmap_builder_allow_overlap(lmap_builder *b, int allow);
+/* Writes the file and frees b: 0 on success, -1 on failure with the reason in
+ * stats->error (pass stats to get it).  Any earlier call that returned -1 failed the
+ * builder; lmap_builder_error says why.  Abort discards everything. */
+int     lmap_builder_close(lmap_builder *b, lmap_build_stats *stats);
+void    lmap_builder_abort(lmap_builder *b);
+const char *lmap_builder_error(const lmap_builder *b);   /* last failure, "" if none */
+
 /* ------------------------------------------------------------------ cursor
  *
  * A cursor walks one member of a KEY axis -- in key order, across chunks that overlap --

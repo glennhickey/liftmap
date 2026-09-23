@@ -22,8 +22,10 @@ resolved.
 
 ## Status
 
-The C library implements the format in `doc/SPEC.md` (format major 2): writer, reader,
-a cursor for key-ordered and point access from either axis, metadata, groups (e.g. a
+The C library implements the format in `doc/SPEC.md` (format major 2): a writer, and a
+builder in front of it that takes runs in any order, reduces them to canonical maximal runs
+and chooses the storage order, spilling to a temporary file over a memory budget; a reader
+with a cursor for key-ordered and point access from either axis; metadata, groups (e.g. a
 genome's sequences), application sections, and a `pread` I/O seam over files, memory and
 container slices. `ref/liftmap.py` is a Python reference for the run codec and chunking.
 
@@ -55,6 +57,7 @@ liftmap began as `libintervalmap`; its history is carried over.
 ```
 liftmap from-paf   in.paf[.gz]   out.lmap   [--swap] [--allow-overlap] [--group-sep C [--group-fields N]]
 liftmap from-chain in.chain[.gz] out.lmap   [--swap] [--allow-overlap] [--group-sep C [--group-fields N]]
+                   (both also take [--mem BYTES] [--tmp-dir DIR])
 liftmap to-paf     in.lmap [out.paf]        [--max-gap N]
 liftmap to-chain   in.lmap [out.chain]      [--max-gap N]
 liftmap lift       in.lmap in.bed [out.bed] [--from a|b]
@@ -71,7 +74,9 @@ regroups runs into records across gaps of at most `--max-gap` bp and writes plac
 scores. If a base of axis a aligns more than once (secondary alignments, or `--swap` onto
 a sequence with several copies), import refuses unless `--allow-overlap`. `--group-sep`
 groups sequences into genomes by the name up to the N-th separator: `.` 1 for `hg38.chr1`,
-`.` 2 for `GCA_000001635.9.chr1`, `#` 2 for PanSN `HG002#1#chr1`.
+`.` 2 for `GCA_000001635.9.chr1`, `#` 2 for PanSN `HG002#1#chr1`. Import holds `--mem`
+bytes of runs (default 1 GiB) and spills beyond that; peak memory is then the budget plus one
+sequence's runs.
 
 Checked against independent tools on the evolver mammals HAL (8 branches): `lift` agrees
 with `halLiftover` on 294,220 single-base mappings in both directions, and with UCSC

@@ -120,6 +120,58 @@ int main(int argc, char **argv) {
       if (t) fclose(t);
       if (q) fclose(q); }
 
+    printf("builder:\n");
+    {
+        lmap_builder *bd = lmap_builder_open(path, "test", 0, NULL);
+        lmap_builder_add_member(bd, 0, "s", 100);
+        lmap_builder_add_member(bd, 1, "t", 100);
+        CHECK("refuses a run on an undeclared member", lmap_builder_add_run(bd, 0, 5, 0, 0, 10, 0) != 0 &&
+              strstr(lmap_builder_error(bd), "not declared") != NULL);
+        lmap_builder_abort(bd);
+        bd = lmap_builder_open(path, "test", 0, NULL);
+        lmap_builder_add_member(bd, 0, "s", 100);
+        lmap_builder_add_member(bd, 1, "t", 100);
+        CHECK("refuses a run past a member end", lmap_builder_add_run(bd, 0, 0, 95, 0, 10, 0) != 0 &&
+              strstr(lmap_builder_error(bd), "outside") != NULL);
+        lmap_builder_abort(bd);
+        bd = lmap_builder_open(path, "test", 0, NULL);
+        lmap_builder_add_member(bd, 0, "s", 100);
+        lmap_builder_add_member(bd, 1, "t", 100);
+        /* one stretch in pieces, out of order, with a duplicate: one canonical run */
+        lmap_builder_add_run(bd, 0, 0, 20, 30, 5, 0);
+        lmap_builder_add_run(bd, 0, 0, 10, 20, 10, 0);
+        lmap_builder_add_run(bd, 0, 0, 12, 22, 3, 0);
+        lmap_builder_add_run(bd, 0, 0, 50, 40, 5, 1);     /* reverse: 50..55 <-> 44..40 */
+        lmap_builder_add_run(bd, 0, 0, 55, 35, 5, 1);     /* continues it: 55..60 <-> 39..35 */
+        lmap_build_stats bs;
+        CHECK("closes", lmap_builder_close(bd, &bs) == 0 && bs.error[0] == 0);
+        CHECK("5 pieces -> 2 maximal runs, order a", bs.input_runs == 5 && bs.runs == 2 && bs.order == LMAP_ORDER_A);
+        f = lmap_open(path);
+        lmap_hit *hh; size_t hn;
+        CHECK("the runs are [10,25)->[20,35) and [50,60)->[35,45) reversed",
+              f && lmap_query_a(f, 0, 0, 100, &hh, &hn, NULL) == 0 && hn == 2 &&
+              hh[0].a == 10 && hh[0].b == 20 && hh[0].len == 15 && hh[0].strand == 0 &&
+              hh[1].a == 50 && hh[1].b == 35 && hh[1].len == 10 && hh[1].strand == 1);
+        free(hh); lmap_close(f);
+        bd = lmap_builder_open(path, "test", 0, NULL);
+        lmap_builder_add_member(bd, 0, "s", 100);
+        lmap_builder_add_member(bd, 1, "t", 100);
+        lmap_builder_add_run(bd, 0, 0, 10, 20, 10, 0);
+        lmap_builder_add_run(bd, 0, 0, 15, 60, 10, 0);
+        CHECK("axis-a overlap fails close unless allowed, with a reason",
+              lmap_builder_close(bd, &bs) != 0 && bs.overlapping_runs == 1 && strstr(bs.error, "overlap"));
+        bd = lmap_builder_open(path, "test", 0, NULL);
+        lmap_builder_add_member(bd, 0, "s", 100);
+        lmap_builder_add_member(bd, 1, "t", 100);
+        lmap_builder_allow_overlap(bd, 1);
+        lmap_builder_add_run(bd, 0, 0, 10, 20, 10, 0);
+        lmap_builder_add_run(bd, 0, 0, 15, 60, 10, 0);
+        CHECK("allowed: written in order b with the overlap flag",
+              lmap_builder_close(bd, &bs) == 0 && bs.order == LMAP_ORDER_B &&
+              (f = lmap_open(path)) != NULL && lmap_a_overlap(f) == 1);
+        if (f) lmap_close(f);
+    }
+
     /* metadata and groups */
     printf("metadata and groups:\n");
     w = lmap_writer_open(path, "test");

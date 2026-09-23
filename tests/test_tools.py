@@ -245,6 +245,20 @@ def main():
     lift_check('a->b', O, pairs, qseqs, 'a', rnd)
     lift_check('b->a', O, pairs, tseqs, 'b', rnd)
 
+    print('spilling (the builder over its memory budget):')
+    recs = gen_records(rnd, qseqs, tseqs, 400, disjoint_q=False)
+    recs += recs[:40]
+    want, pairs = canonical_runs(recs)
+    paf = os.path.join(wd, 'sp.paf'); write_paf(recs, qseqs, tseqs, paf)
+    SP, NS = os.path.join(wd, 'sp.lmap'), os.path.join(wd, 'ns.lmap')
+    p = run('from-paf', paf, SP, '--allow-overlap', '--mem', 1, '--tmp-dir', wd)
+    run('from-paf', paf, NS, '--allow-overlap')
+    check('--mem 1 spills', '(spilled)' in p.stderr)
+    check(f'spilled import gives the canonical {len(want)} runs', dump(SP) == want)
+    check('and the same runs as the in-memory import', dump(SP) == dump(NS))
+    check('spill files are gone afterwards', not [x for x in os.listdir(wd) if x.startswith('lmap.spill')])
+    lift_check('spilled a->b', SP, pairs, qseqs, 'a', rnd)
+
     print('malformed input:')
     bad = os.path.join(wd, 'bad.paf')
     with open(bad, 'w') as f:
