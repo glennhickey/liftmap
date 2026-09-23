@@ -1830,6 +1830,11 @@ int lmap_verify(lmap_file *f) {
     return 0;
 }
 
+uint32_t lmap_n_app_sections(const lmap_file *f) { return f ? f->n_xs : 0; }
+const char *lmap_app_section_id(const lmap_file *f, uint32_t i) {
+    return (f && i < f->n_xs) ? f->xs[i].id : NULL;
+}
+
 int lmap_read_section(lmap_file *f, const char *id, uint8_t **out, size_t *n) {
     if (!f || !id || !out || !n) return -1;
     for (uint32_t i = 0; i < f->n_xs; i++) {

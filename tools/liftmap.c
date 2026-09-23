@@ -5,6 +5,7 @@
  *   liftmap to-paf     in.lmap [out.paf]        [--max-gap N]
  *   liftmap to-chain   in.lmap [out.chain]      [--max-gap N]
  *   liftmap lift       in.lmap in.bed [out.bed] [--from a|b]
+ *   liftmap coarsen    in.lmap out.lmap --max-gap N [--key a|b] [--mem BYTES] [--tmp-dir DIR]
  *   liftmap dump       in.lmap [out.tsv]
  *   liftmap info       in.lmap
  *   liftmap verify     in.lmap
@@ -468,6 +469,7 @@ static void usage(void) {
         "  liftmap to-paf     in.lmap [out.paf]        [--max-gap N]\n"
         "  liftmap to-chain   in.lmap [out.chain]      [--max-gap N]\n"
         "  liftmap lift       in.lmap in.bed [out.bed] [--from a|b]\n"
+        "  liftmap coarsen    in.lmap out.lmap --max-gap N [--key a|b]\n"
         "  liftmap dump       in.lmap [out.tsv]\n"
         "  liftmap info       in.lmap\n"
         "  liftmap verify     in.lmap\n"
@@ -478,6 +480,8 @@ static void usage(void) {
         "records joined across gaps of at most --max-gap bp (default 10000).\n"
         "Import holds --mem bytes of runs (default 1 GiB), then spills sorted runs to a\n"
         "temporary file in --tmp-dir (default: the output's directory).\n"
+        "coarsen chains runs across gaps of at most --max-gap bp on both axes into longer,\n"
+        "approximate runs whose length is their span on the --key axis (default b).\n"
         "--group-sep C groups sequences into genomes by the name up to the N-th C\n"
         "(--group-fields, default 1): '.' 1 for hg38.chr1, '.' 2 for GCA_000001635.9.chr1,\n"
         "'#' 2 for PanSN HG002#1#chr1.\n");
@@ -500,6 +504,7 @@ int main(int argc, char **argv) {
     size_t mem_bytes = 0;
     const char *tmp_dir = NULL;
     int64_t max_gap = 10000;
+    int key_b = 1, gap_given = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--swap")) swap = 1;
         else if (!strcmp(argv[i], "--allow-overlap")) allow_overlap = 1;
@@ -514,7 +519,11 @@ int main(int argc, char **argv) {
             group_fields = atoi(argv[++i]);
             if (group_fields < 1) usage();
         }
-        else if (!strcmp(argv[i], "--max-gap") && i + 1 < argc) max_gap = strtoll(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--max-gap") && i + 1 < argc) { max_gap = strtoll(argv[++i], NULL, 10); gap_given = 1; }
+        else if (!strcmp(argv[i], "--key") && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (!strcmp(v, "a")) key_b = 0; else if (!strcmp(v, "b")) key_b = 1; else usage();
+        }
         else if (!strcmp(argv[i], "--from") && i + 1 < argc) {
             const char *v = argv[++i];
             if (!strcmp(v, "a")) from_b = 0; else if (!strcmp(v, "b")) from_b = 1; else usage();
@@ -543,6 +552,25 @@ int main(int argc, char **argv) {
         FILE *o = open_out(pos[1]);
         export_records(f, o, !strcmp(cmd, "to-chain"), max_gap);
         close_out(o, pos[1]); lmap_close(f);
+        return 0;
+    }
+    if (!strcmp(cmd, "coarsen")) {
+        if (npos != 2 || !gap_given) usage();
+        lmap_file *f = open_or_die(pos[0]);
+        lmap_builder *b = lmap_builder_open(pos[1], lmap_profile(f), mem_bytes, tmp_dir);
+        if (!b) die("cannot write %s", pos[1]);
+        lmap_builder_set_order(b, lmap_order(f));
+        lmap_coarsen_stats cs;
+        if (lmap_builder_copy_layout(b, f) || lmap_coarsen(f, b, key_b, max_gap, &cs))
+            die("%s", lmap_builder_error(b));
+        lmap_build_stats st;
+        if (lmap_builder_close(b, &st)) die("%s", st.error);
+        fprintf(stderr, "liftmap: %" PRIu64 " runs -> %" PRIu64 " chains -> %" PRIu64 " runs "
+                "(%.1fx), %" PRIu64 " bp clipped at sequence ends, order %c -> %s\n",
+                cs.runs_in, cs.chains_out, st.runs,
+                st.runs ? (double)cs.runs_in / (double)st.runs : 0.0, cs.clipped_bp,
+                st.order == LMAP_ORDER_B ? 'b' : 'a', pos[1]);
+        lmap_close(f);
         return 0;
     }
     if (!strcmp(cmd, "lift")) {

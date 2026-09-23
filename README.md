@@ -24,8 +24,9 @@ resolved.
 
 The C library implements the format in `doc/SPEC.md` (format major 2): a writer, and a
 builder in front of it that takes runs in any order, reduces them to canonical maximal runs
-and chooses the storage order, spilling to a temporary file over a memory budget; a reader
-with a cursor for key-ordered and point access from either axis; metadata, groups (e.g. a
+and chooses the storage order, spilling to a temporary file over a memory budget;
+coarsening (`lmap_coarsen`) for zoomed-out levels of detail; a reader with a cursor for
+key-ordered and point access from either axis; metadata, groups (e.g. a
 genome's sequences), application sections, and a `pread` I/O seam over files, memory and
 container slices. `ref/liftmap.py` is a Python reference for the run codec and chunking.
 
@@ -61,6 +62,7 @@ liftmap from-chain in.chain[.gz] out.lmap   [--swap] [--allow-overlap] [--group-
 liftmap to-paf     in.lmap [out.paf]        [--max-gap N]
 liftmap to-chain   in.lmap [out.chain]      [--max-gap N]
 liftmap lift       in.lmap in.bed [out.bed] [--from a|b]
+liftmap coarsen    in.lmap out.lmap --max-gap N [--key a|b]
 liftmap dump | info | verify  in.lmap
 ```
 
@@ -77,6 +79,12 @@ groups sequences into genomes by the name up to the N-th separator: `.` 1 for `h
 `.` 2 for `GCA_000001635.9.chr1`, `#` 2 for PanSN `HG002#1#chr1`. Import holds `--mem`
 bytes of runs (default 1 GiB) and spills beyond that; peak memory is then the budget plus one
 sequence's runs.
+
+`coarsen` chains runs across gaps of at most `--max-gap` bp on both axes into fewer, longer,
+approximate runs whose length is their span on the `--key` axis — a zoomed-out level of
+detail. It keeps the input's sequences, groups, metadata and application sections and
+records `max_gap`. taffy's `tui-chain` is this operation on the column axis: on the rodent
+universal index both give the same 7,748,116 runs from 84,970,744.
 
 Checked against independent tools on the evolver mammals HAL (8 branches): `lift` agrees
 with `halLiftover` on 294,220 single-base mappings in both directions, and with UCSC

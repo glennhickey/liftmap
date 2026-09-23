@@ -185,6 +185,14 @@ one. Under order b it bounds the cut axis itself, so one chunk never covers more
 columns — the role of `.tui`'s `TUI_CHUNK_G_MAX`, which cut a full-chromosome lift to a
 distant target from 196 s to 1.7 s.
 
+**Coarsening.** A coarsened file (`lmap_coarsen`) is an ordinary liftmap whose runs were
+chained across gaps: along each member of a key axis, a member of the other axis extends its
+open chain when the strand matches and both gaps are within `max_gap`, and the chain's
+length becomes its key-axis span. Its extent on the other axis is therefore approximate, it
+may overlap there (`A_OVERLAP`), and it is clipped at the member's end. `max_gap` in the
+metadata says so. Readers need nothing special; exact-coordinate consumers should refuse a
+file whose `max_gap` is non-zero unless told otherwise, as taffy does.
+
 **Implementation status.** The C library implements both orders with `seqbound both`,
 recorded in header feature bit 0 (section 2), and `A_OVERLAP` (bit 1) under order b. It rejects a chunk whose extent would not fit
 the u32 span fields rather than letting one wrap. Under order b the writer holds one axis-a

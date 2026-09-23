@@ -420,6 +420,116 @@ int lmap_builder_close(lmap_builder *b, lmap_build_stats *stats) {
     return rc;
 }
 
+int lmap_builder_copy_layout(lmap_builder *b, lmap_file *f) {
+    if (!b || !f || b->failed) return -1;
+    if (b->n_mem[0] || b->n_mem[1]) return fail(b, "copy_layout needs a fresh builder");
+    for (int ax = 0; ax < 2; ax++)
+        for (uint32_t i = 0; i < lmap_n_members(f, ax); i++) {
+            const lmap_member *m = lmap_member_at(f, ax, i);
+            if (lmap_builder_add_member(b, ax, m->name, m->length) != (int32_t)i) return -1;
+        }
+    for (int ax = 0; ax < 2; ax++)
+        for (uint32_t g = 0; g < lmap_n_groups(f, ax); g++) {
+            if (lmap_writer_add_group(b->w, ax, lmap_group_name(f, ax, g)) != (int32_t)g)
+                return fail(b, "cannot copy group %s", lmap_group_name(f, ax, g));
+            const uint32_t *mm; uint32_t n;
+            lmap_group_members(f, ax, g, &mm, &n, NULL);
+            for (uint32_t k = 0; k < n; k++)
+                if (lmap_writer_set_member_group(b->w, ax, mm[k], g)) return fail(b, "cannot copy group");
+        }
+    for (uint32_t i = 0; i < lmap_meta_count(f); i++) {
+        const char *k, *v;
+        lmap_meta_at(f, i, &k, &v);
+        if (lmap_writer_set_meta(b->w, k, v)) return fail(b, "cannot copy metadata %s", k);
+    }
+    for (uint32_t i = 0; i < lmap_n_app_sections(f); i++) {
+        const char *id = lmap_app_section_id(f, i);
+        uint8_t *p; size_t n;
+        if (lmap_read_section(f, id, &p, &n) != 0) return fail(b, "cannot read section %s", id);
+        int rc = lmap_writer_add_section(b->w, id, p, n);
+        free(p);
+        if (rc) return fail(b, "cannot copy section %s", id);
+    }
+    return 0;
+}
+
+/* ---- coarsening ---- */
+
+typedef struct { int64_t k, o, len; uint8_t strand; } chain;
+
+/* Clip a chain at the other member's end and hand it to the builder. */
+static int emit_chain(lmap_builder *b, int K, uint32_t km, uint32_t om, chain c,
+                      uint64_t olen, lmap_coarsen_stats *st) {
+    if ((uint64_t)(c.o + c.len) > olen) {
+        int64_t e = (int64_t)((uint64_t)(c.o + c.len) - olen);
+        if (e >= c.len) { st->dropped++; st->clipped_bp += (uint64_t)c.len; return 0; }
+        /* forward: the far end is the tail; reverse: it pairs with the key start */
+        if (c.strand) c.k += e;
+        c.len -= e; st->clipped_bp += (uint64_t)e;
+    }
+    st->chains_out++;
+    return K ? lmap_builder_add_run(b, om, km, c.o, c.k, c.len, c.strand)
+             : lmap_builder_add_run(b, km, om, c.k, c.o, c.len, c.strand);
+}
+
+int lmap_coarsen(lmap_file *f, lmap_builder *b, int K, int64_t max_gap,
+                 lmap_coarsen_stats *stats) {
+    lmap_coarsen_stats st = {0};
+    if (!f || !b || b->failed || (K != 0 && K != 1) || max_gap < 0) return -1;
+    int O = 1 - K;
+    uint32_t no = lmap_n_members(f, O);
+    chain *act = malloc((no ? no : 1) * sizeof *act);
+    uint8_t *on = calloc(no ? no : 1, 1);
+    uint32_t *list = malloc((no ? no : 1) * sizeof *list);   /* members with an open chain */
+    if (!act || !on || !list) { free(act); free(on); free(list); return fail(b, "out of memory"); }
+    lmap_builder_allow_overlap(b, 1);
+    int rc = 0;
+    for (uint32_t km = 0; rc == 0 && km < lmap_n_members(f, K); km++) {
+        lmap_cursor *c = lmap_cursor_open(f, K, km, NULL, 0, 0);
+        if (!c) { rc = fail(b, "cannot open a cursor"); break; }
+        uint32_t nlist = 0;
+        lmap_hit h;
+        int got;
+        rc = lmap_cursor_seek(c, 0, (int64_t)lmap_member_at(f, K, km)->length);
+        while (rc == 0 && (got = lmap_cursor_next(c, &h)) != 0) {
+            if (got < 0) { rc = fail(b, "corrupt chunk while coarsening"); break; }
+            st.runs_in++;
+            uint32_t om = K ? h.a_member : h.b_member;
+            int64_t k = K ? h.b : h.a, o = K ? h.a : h.b;
+            chain *ch = &act[om];
+            if (on[om] && ch->strand == h.strand) {
+                int64_t kg = k - (ch->k + ch->len);
+                int64_t og = h.strand ? ch->o - (o + h.len) : o - (ch->o + ch->len);
+                if (kg >= 0 && kg <= max_gap && og >= 0 && og <= max_gap) {
+                    ch->len = k + h.len - ch->k;
+                    if (h.strand) ch->o = o;
+                    continue;
+                }
+            }
+            if (on[om]) {
+                if (emit_chain(b, K, km, om, *ch, lmap_member_at(f, O, om)->length, &st)) { rc = -1; break; }
+            } else { on[om] = 1; list[nlist++] = om; }
+            ch->k = k; ch->o = o; ch->len = h.len; ch->strand = h.strand;
+        }
+        lmap_cursor_close(c);
+        for (uint32_t i = 0; i < nlist; i++) {           /* close this key member's chains */
+            uint32_t om = list[i];
+            if (rc == 0 && emit_chain(b, K, km, om, act[om], lmap_member_at(f, O, om)->length, &st)) rc = -1;
+            on[om] = 0;
+        }
+    }
+    free(act); free(on); free(list);
+    if (rc == 0) {
+        const char *old = lmap_meta_get(f, "max_gap");
+        int64_t prev = old ? strtoll(old, NULL, 10) : 0;
+        char v[32];
+        snprintf(v, sizeof v, "%lld", (long long)(prev > max_gap ? prev : max_gap));
+        if (lmap_writer_set_meta(b->w, "max_gap", v)) rc = fail(b, "cannot set max_gap");
+    }
+    if (stats) *stats = st;
+    return rc == 0 ? 0 : -1;
+}
+
 void lmap_builder_abort(lmap_builder *b) {
     if (!b) return;
     if (b->w) lmap_writer_abort(b->w);

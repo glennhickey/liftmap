@@ -148,6 +148,8 @@ const lmap_chunk  *lmap_chunk_at(const lmap_file *f, uint32_t i);
  * Returns 0 with *out malloc'd (caller frees), 1 if the file has no such section, -1 on
  * error. */
 int lmap_read_section(lmap_file *f, const char *id, uint8_t **out, size_t *n);
+uint32_t    lmap_n_app_sections(const lmap_file *f);            /* the x.* sections */
+const char *lmap_app_section_id(const lmap_file *f, uint32_t i);
 
 /* Members whose name begins with `prefix` form a contiguous range in name order:
  * ranks [*first_rank, *first_rank + *count).  lmap_member_by_rank maps a rank to a
@@ -239,6 +241,31 @@ int     lmap_builder_allow_overlap(lmap_builder *b, int allow);
 int     lmap_builder_close(lmap_builder *b, lmap_build_stats *stats);
 void    lmap_builder_abort(lmap_builder *b);
 const char *lmap_builder_error(const lmap_builder *b);   /* last failure, "" if none */
+
+/* Declare f's members (same ids, both axes), groups, metadata and application sections
+ * on a fresh builder: the start of any file derived from f. */
+int lmap_builder_copy_layout(lmap_builder *b, lmap_file *f);
+
+/* ------------------------------------------------------------------ coarsening
+ *
+ * Chain f's runs across small gaps into fewer, longer, APPROXIMATE runs -- a zoomed-out
+ * level of detail (taffy's tui-chain, a hal2 LOD sidecar).  Along each member of
+ * key_axis, in key order, each member of the other axis keeps one open chain; a run
+ * extends it when it has the same strand and the gap to it is between 0 and max_gap on
+ * both axes.  A chain's length is its span on the key axis, so its extent on the other
+ * axis is approximate (it drifts wherever the two gaps it bridged differ), and chains of
+ * one member may overlap on the other axis.  A chain is clipped where it would pass the
+ * other member's end.  max_gap 0 merges only exact continuations.
+ *
+ * The chains go to b, which should hold f's layout (lmap_builder_copy_layout); coarsen
+ * allows axis-a overlap on it and raises its max_gap metadata to max_gap. */
+typedef struct {
+    uint64_t runs_in, chains_out;
+    uint64_t clipped_bp, dropped;   /* bases cut at the other member's end; chains lost whole */
+} lmap_coarsen_stats;
+
+int lmap_coarsen(lmap_file *f, lmap_builder *b, int key_axis, int64_t max_gap,
+                 lmap_coarsen_stats *stats);
 
 /* ------------------------------------------------------------------ cursor
  *

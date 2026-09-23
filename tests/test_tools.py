@@ -147,6 +147,44 @@ def canonical_runs(recs):
                 start = prev = a
     return sorted(runs), pairs
 
+def coarsen_oracle(runs, key, gap, lens):
+    """The chaining rule, run by run: per (key member, other member), in key order, extend
+    the open chain when the strand matches and both gaps are in [0, gap]; a chain's length
+    is its key span; clip at the other member's end; then canonical form of the result."""
+    K = 1 if key == 'b' else 0
+    per = {}
+    for q, a, t, b, L, s in runs:
+        km, om, k, o = (t, q, b, a) if K else (q, t, a, b)
+        per.setdefault((km, om), []).append((k, o, L, s))
+    chains = []
+    for (km, om), rs in per.items():
+        rs.sort()
+        cur = None
+        for k, o, L, s in rs:
+            if cur and cur[3] == s:
+                kg = k - (cur[0] + cur[2])
+                og = (cur[1] - (o + L)) if s == '-' else (o - (cur[1] + cur[2]))
+                if 0 <= kg <= gap and 0 <= og <= gap:
+                    cur = [cur[0], o if s == '-' else cur[1], k + L - cur[0], s]
+                    continue
+            if cur: chains.append((km, om, *cur))
+            cur = [k, o, L, s]
+        if cur: chains.append((km, om, *cur))
+    pairs = set()
+    for km, om, k, o, L, s in chains:
+        e = o + L - lens[om]
+        if e > 0:
+            if e >= L: continue
+            if s == '-': k += e
+            L -= e
+        for i in range(L):
+            kk, oo = k + i, (o + L - 1 - i) if s == '-' else o + i
+            a, b = (oo, kk) if K else (kk, oo)
+            q, t = (om, km) if K else (km, om)
+            pairs.add((q, t, 1 if s == '-' else 0, a, b))
+    rec = [dict(q=q, t=t, strand='-' if s else '+', pairs=[(a, b)]) for q, t, s, a, b in pairs]
+    return canonical_runs(rec)[0]
+
 def dump(lmap):
     out = run('dump', lmap).stdout
     return sorted((f[0], int(f[1]), f[2], int(f[3]), int(f[4]), f[5])
@@ -258,6 +296,23 @@ def main():
     check('and the same runs as the in-memory import', dump(SP) == dump(NS))
     check('spill files are gone afterwards', not [x for x in os.listdir(wd) if x.startswith('lmap.spill')])
     lift_check('spilled a->b', SP, pairs, qseqs, 'a', rnd)
+
+    print('coarsening:')
+    recs = gen_records(rnd, qseqs, tseqs, 60, disjoint_q=True)
+    base, pairs = canonical_runs(recs)
+    paf = os.path.join(wd, 'co.paf'); write_paf(recs, qseqs, tseqs, paf)
+    C0 = os.path.join(wd, 'co.lmap'); run('from-paf', paf, C0)
+    lens = {**qseqs, **tseqs}
+    for key in ('a', 'b'):
+        for gap in (0, 50):
+            out = os.path.join(wd, f'co.{key}.{gap}.lmap')
+            run('coarsen', C0, out, '--max-gap', gap, '--key', key)
+            want = coarsen_oracle(base, key, gap, lens)
+            check(f'coarsen --key {key} --max-gap {gap}: {len(want)} runs match the oracle', dump(out) == want)
+            info = run('info', out).stdout
+            check(f'  max_gap {gap} recorded, sequences and metadata carried over',
+                  f'meta.max_gap\t{gap}' in info and 'meta.axis.a\tquery' in info)
+    check('--max-gap 0 changes nothing', dump(os.path.join(wd, 'co.b.0.lmap')) == base)
 
     print('malformed input:')
     bad = os.path.join(wd, 'bad.paf')
