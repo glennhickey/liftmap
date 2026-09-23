@@ -25,6 +25,10 @@
 
 #include "lmap_io.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define LMAP_FORMAT_MAJOR 3
 
 #define LMAP_ORDER_A     0          /* chunks cut and runs stored along axis a */
@@ -340,5 +344,9 @@ typedef struct {
 
 int lmap_coarsen(lmap_file *f, lmap_builder *b, int key_axis, int64_t max_gap,
                  lmap_coarsen_stats *stats);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* LIFTMAP_H */

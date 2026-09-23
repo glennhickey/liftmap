@@ -12,6 +12,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct lmap_io lmap_io;
 
 /* Backend vtable.  read() returns bytes read, or -1; it must fill the whole
@@ -69,5 +73,9 @@ int lmap_pread(lmap_io *io, void *buf, int64_t off, int64_t len);
 
 int64_t lmap_io_size(const lmap_io *io);
 void    lmap_io_close(lmap_io *io);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* LMAP_IO_H */
