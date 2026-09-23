@@ -75,8 +75,17 @@ int main(int argc,char**argv){
 
     { /* The payload is not read at open (it scales with the data); each chunk is
        * checked on read against its directory CRC, and lmap_verify checks it all.
-       * The middle byte of a real file lies in the runs section, which dominates. */
-      uint8_t *c=malloc((size_t)n); memcpy(c,orig,(size_t)n); c[n/2]^=0x10;
+       * Flip a byte in the middle of chunk 0: the writer puts the runs section straight
+       * after the header, so chunk 0 starts at LMAP_HEADER_SIZE + its offset. */
+      long at = -1;
+      { lmap_io *io0 = lmap_io_open_mem(orig,n); lmap_file *f0 = io0 ? lmap_open_io(io0,0) : NULL;
+        const lmap_chunk *c0 = f0 ? lmap_chunk_at(f0,0) : NULL;
+        if (c0) at = (long)(LMAP_HEADER_SIZE + c0->off + c0->clen / 2);
+        if (f0) lmap_close(f0);
+        if (io0) lmap_io_close(io0); }
+      CHECK("found chunk 0 to corrupt", at > 0 && at < n);
+      if (at <= 0 || at >= n) at = n / 2;
+      uint8_t *c=malloc((size_t)n); memcpy(c,orig,(size_t)n); c[at]^=0x10;
       lmap_io *io = lmap_io_open_mem(c,n);
       lmap_file *f = io ? lmap_open_io(io,0) : NULL;
       CHECK("a payload bit flip still opens (payload is not read at open)", f != NULL);

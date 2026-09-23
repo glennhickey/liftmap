@@ -199,11 +199,13 @@ recorded in header feature bit 0 (section 2), and `A_OVERLAP` (bit 1) under orde
 the u32 span fields rather than letting one wrap. Under order b the writer holds one axis-a
 member's runs in memory at a time, which is the same bound `.tui`'s own builder has.
 
-**Known limit: the writer holds the whole compressed `runs` section in memory until close.**
-That is fine at the scale tested so far — a few GB for the fish subtree — but not for a
-577-way-sized index (~100 GB). Streaming chunks to disk as they are emitted is a writer
-change only: the format already puts the directories after the payload, so nothing on disk
-needs to move.
+**The writer streams the payload.** The `runs` section is written straight after the header
+as each chunk is encoded, and every other section follows it at close (the header is
+written last, over a placeholder); section order is free, since the footer locates
+everything. What the writer holds is the chunk directory (80 bytes per chunk: ~0.8 GB at
+10^7 chunks) and, under order b, one axis-a member's runs while they are sorted and cut.
+An earlier version buffered the whole compressed payload until close -- ~100 GB for a
+577-way `.tui`.
 
 ---
 

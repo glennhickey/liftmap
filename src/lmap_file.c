@@ -3,6 +3,7 @@
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
+#define _FILE_OFFSET_BITS 64        /* fseeko past 2 GiB on 32-bit builds too */
 #include "lmap_file.h"
 
 #include <stdio.h>
@@ -100,6 +101,10 @@ typedef struct {
     int64_t last_a_exit; int has_runs;       /* axis-a order is per member, across chunks */
 } wmember;
 
+static int write_all(FILE *fp, const void *p, size_t n) {
+    return (n == 0 || fwrite(p, 1, n, fp) == n) ? 0 : -1;
+}
+
 struct lmap_writer {
     FILE    *fp;
     char    *path, *tmp, *profile;    /* written to tmp, renamed to path on close */
@@ -123,7 +128,10 @@ struct lmap_writer {
 
     /* order b: one whole axis-a member buffered, with each run's axis-b member */
     struct brun { lmap_run r; uint32_t bm; } *bbuf;  uint32_t n_bbuf, cap_bbuf, bbuf_amem;
-    vec runs;                                        /* the runs section body */
+    /* The runs section is written to the file as chunks are encoded, straight after the
+     * header, so the payload never accumulates in memory; everything else -- directories,
+     * metadata, groups -- follows it at close, and the header is written last. */
+    uint64_t runs_len; uLong runs_crc;
     int failed;
 };
 
@@ -141,7 +149,11 @@ lmap_writer *lmap_writer_open(const char *path, const char *profile) {
     w->path = strdup(path);
     w->profile = strdup(profile ? profile : "");
     w->count = 8192; w->bspan = 1000000; w->codec = LMAP_CODEC_DEFLATE; w->order = LMAP_ORDER_A;
-    if (!w->path || !w->profile) { lmap_writer_abort(w); return NULL; }
+    w->runs_crc = crc32(0L, Z_NULL, 0);
+    uint8_t zero[LMAP_HEADER_SIZE] = {0};                /* the real header comes at close */
+    if (!w->path || !w->profile || write_all(w->fp, zero, sizeof zero) != 0) {
+        lmap_writer_abort(w); return NULL;
+    }
     return w;
 }
 
@@ -314,14 +326,18 @@ static int emit_chunk(lmap_writer *w, const lmap_run *runs, uint32_t n, uint32_t
     c->base = w->order == LMAP_ORDER_A
             ? (uint64_t)lmap_b_enter(runs[0].b, runs[0].len, runs[0].strand)
             : (uint64_t)runs[0].a;
-    c->off = w->runs.n;
+    c->off = w->runs_len;
     c->clen = (uint32_t)bodylen;
     c->rawlen = rawlen32;
     c->n_runs = n;
     c->codec = (uint32_t)w->codec;
     c->crc = crc_all(body, bodylen);
 
-    int rc = vec_put(&w->runs, body, bodylen);
+    int rc = write_all(w->fp, body, bodylen);            /* straight to the file */
+    if (rc == 0) {
+        w->runs_crc = crc32(w->runs_crc, body, (uInt)bodylen);   /* bodylen <= 2^30 + 32 */
+        w->runs_len += bodylen;
+    }
     vec_free(&blob);
     if (rc != 0) return -1;
 
@@ -527,10 +543,6 @@ static int cmp_by_b(const void *x, const void *y) {
     return p->id < q->id ? -1 : p->id > q->id;
 }
 
-static int write_all(FILE *fp, const void *p, size_t n) {
-    return (n == 0 || fwrite(p, 1, n, fp) == n) ? 0 : -1;
-}
-
 int lmap_writer_close(lmap_writer *w) {
     if (!w) return -1;
     int rc = -1;
@@ -608,7 +620,9 @@ int lmap_writer_close(lmap_writer *w) {
                        (w->a_overlap ? LMAP_FEAT_A_OVERLAP : 0));
         strncpy((char *)hdr + 24, w->profile, 31);
         hdr_crc = crc_all(hdr, sizeof hdr);
-        if (write_all(w->fp, hdr, sizeof hdr) != 0) goto done;
+        /* over the placeholder written at open; then back to the end */
+        if (fseeko(w->fp, 0, SEEK_SET) != 0 || write_all(w->fp, hdr, sizeof hdr) != 0 ||
+            fseeko(w->fp, 0, SEEK_END) != 0) goto done;
     }
 
     /* --- meta: u32 n, then n x (u32 klen, key, u32 vlen, value), sorted by key --- */
@@ -674,7 +688,6 @@ int lmap_writer_close(lmap_writer *w) {
     builtin[NB++] = (secdesc){ "mem.b",     mb.p,      mb.n      };
     if (w->n_grp[0]) builtin[NB++] = (secdesc){ "grp.a", grp[0].p, grp[0].n };
     if (w->n_grp[1]) builtin[NB++] = (secdesc){ "grp.b", grp[1].p, grp[1].n };
-    builtin[NB++] = (secdesc){ "runs",      w->runs.p, w->runs.n };
     builtin[NB++] = (secdesc){ "dir.a",     dira.p,    dira.n    };
     builtin[NB++] = (secdesc){ "dir.a.max", dirax.p,   dirax.n   };
     builtin[NB++] = (secdesc){ "dir.b",     dirb.p,    dirb.n    };
@@ -688,7 +701,8 @@ int lmap_writer_close(lmap_writer *w) {
     for (uint32_t i = 0; i < w->n_xs; i++) {
         sec[NB + i].id = w->xs[i].id; sec[NB + i].p = w->xs[i].p; sec[NB + i].n = w->xs[i].n;
     }
-    uint64_t cur = LMAP_HEADER_SIZE;
+    /* the runs section is already on disk, at the header's end */
+    uint64_t cur = LMAP_HEADER_SIZE + w->runs_len;
     int wbad = 0;
     for (uint32_t i = 0; i < NSEC && !wbad; i++) {
         uint8_t pad[8] = {0};
@@ -702,7 +716,15 @@ int lmap_writer_close(lmap_writer *w) {
     }
 
     /* --- footer --- */
-    if (!wbad && vec_put32(&foot, NSEC) != 0) wbad = 1;
+    if (!wbad && vec_put32(&foot, NSEC + 1) != 0) wbad = 1;
+    if (!wbad) {
+        static const char rid[] = "runs";
+        uint8_t idlen = 4, cb = LMAP_CODEC_NONE, fl = 0;
+        if (vec_put(&foot, &idlen, 1) || vec_put(&foot, rid, 4) ||
+            vec_put64(&foot, LMAP_HEADER_SIZE) || vec_put64(&foot, w->runs_len) ||
+            vec_put64(&foot, w->runs_len) || vec_put(&foot, &cb, 1) || vec_put(&foot, &fl, 1) ||
+            vec_put32(&foot, (uint32_t)w->runs_crc)) wbad = 1;
+    }
     for (uint32_t i = 0; i < NSEC && !wbad; i++) {
         uint8_t idlen = (uint8_t)strlen(sec[i].id);
         uint8_t cb = LMAP_CODEC_NONE, fl = 0;
@@ -754,7 +776,6 @@ void lmap_writer_abort(lmap_writer *w) {
     free(w->pend); free(w->chunks); free(w->bbuf);
     for (uint32_t i = 0; i < w->n_xs; i++) { free(w->xs[i].id); free(w->xs[i].p); }
     free(w->xs);
-    vec_free(&w->runs);
     for (uint32_t i = 0; i < w->n_meta; i++) { free(w->meta[i].k); free(w->meta[i].v); }
     free(w->meta);
     for (int ax = 0; ax < 2; ax++) {
