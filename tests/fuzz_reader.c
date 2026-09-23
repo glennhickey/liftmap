@@ -45,6 +45,8 @@ int main(int argc, char **argv) {
             }
         }
     }
+    int vr = lmap_verify(f);                         /* the whole file, every range */
+    (void)vr;
     printf("  opened: %u chunks, %u/%u members, %ld chunks decoded, %ld hits, %ld invalid\n",
            nc, lmap_n_members(f, 0), lmap_n_members(f, 1), decoded, hits, bad);
     lmap_close(f);

@@ -535,7 +535,7 @@ int lmap_writer_close(lmap_writer *w) {
     if (!w) return -1;
     int rc = -1;
     vec foot = {0}, dira = {0}, dirax = {0}, dirb = {0}, ma = {0}, mb = {0};
-    vec meta = {0}, grp[2] = {{0}};
+    vec meta = {0}, grp[2] = {{0}}, dcrc = {0};
     if (w->failed) goto done;
     if ((w->order == LMAP_ORDER_B ? flush_member_b(w) : flush_chunk(w)) != 0) goto done;
 
@@ -646,9 +646,28 @@ int lmap_writer_close(lmap_writer *w) {
         if (bad) goto done;
     }
 
+    /* --- dir.crc: page size, chunk count, totals, then a CRC per page of dir.a,
+     * dir.a.max and dir.b, so a reader can load and check one page at a time --- */
+    {
+        uint64_t nruns = 0, nbytes = 0;
+        for (uint32_t i = 0; i < w->n_chunks; i++) { nruns += w->chunks[i].n_runs; nbytes += w->chunks[i].clen; }
+        uint32_t npages = (w->n_chunks + LMAP_DIR_PAGE - 1) / LMAP_DIR_PAGE;
+        int bad = vec_put32(&dcrc, LMAP_DIR_PAGE) || vec_put32(&dcrc, 0) ||
+                  vec_put64(&dcrc, w->n_chunks) || vec_put64(&dcrc, nruns) || vec_put64(&dcrc, nbytes);
+        const vec *secs[3] = { &dira, &dirax, &dirb };
+        const size_t es[3] = { LMAP_DIRA_ENTRY, 8, LMAP_DIRB_ENTRY };
+        for (int k = 0; !bad && k < 3; k++)
+            for (uint32_t pg = 0; !bad && pg < npages; pg++) {
+                uint64_t first = (uint64_t)pg * LMAP_DIR_PAGE;
+                uint64_t cnt = w->n_chunks - first < LMAP_DIR_PAGE ? w->n_chunks - first : LMAP_DIR_PAGE;
+                bad = vec_put32(&dcrc, crc_all(secs[k]->p + first * es[k], cnt * es[k]));
+            }
+        if (bad) goto done;
+    }
+
     /* --- sections --- */
     typedef struct { const char *id; const uint8_t *p; size_t n; } secdesc;
-    secdesc builtin[10];
+    secdesc builtin[16];
     uint32_t NB = 0;
     builtin[NB++] = (secdesc){ "meta",      meta.p,    meta.n    };
     builtin[NB++] = (secdesc){ "mem.a",     ma.p,      ma.n      };
@@ -659,6 +678,7 @@ int lmap_writer_close(lmap_writer *w) {
     builtin[NB++] = (secdesc){ "dir.a",     dira.p,    dira.n    };
     builtin[NB++] = (secdesc){ "dir.a.max", dirax.p,   dirax.n   };
     builtin[NB++] = (secdesc){ "dir.b",     dirb.p,    dirb.n    };
+    builtin[NB++] = (secdesc){ "dir.crc",   dcrc.p,    dcrc.n    };
     const uint32_t NSEC = NB + w->n_xs;
     secdesc  *sec = malloc(NSEC * sizeof *sec);
     uint64_t *off = malloc(NSEC * sizeof *off), *len = malloc(NSEC * sizeof *len);
@@ -716,7 +736,7 @@ int lmap_writer_close(lmap_writer *w) {
     rc = 0;
 done:
     vec_free(&foot); vec_free(&dira); vec_free(&dirax); vec_free(&dirb); vec_free(&ma); vec_free(&mb);
-    vec_free(&meta); vec_free(&grp[0]); vec_free(&grp[1]);
+    vec_free(&meta); vec_free(&grp[0]); vec_free(&grp[1]); vec_free(&dcrc);
     if (w->fp) { if (fclose(w->fp) != 0) rc = -1; w->fp = NULL; }
     if (rc == 0 && rename(w->tmp, w->path) != 0) rc = -1;
     if (rc != 0) remove(w->tmp);                /* no half-written file left behind */
@@ -760,10 +780,17 @@ struct lmap_file {
         uint32_t *first, *list;  /* members of g: list[first[g] .. first[g+1]), name order */
         uint64_t *length;        /* summed member lengths */
     } grp[2];
-    lmap_chunk *chunks; uint32_t n_chunks;
-    uint32_t *dirb_id; uint64_t *dirb_max;
-    uint64_t *dira_max;
-    lmap_member *mem[2]; uint32_t n_mem[2];
+    /* Chunk directories, paged (SPEC 2.2b): a page of LMAP_DIR_PAGE entries is read and
+     * checked against its CRC in dir.crc the first time anything needs it, and installed
+     * atomically so a shared lmap_file stays safe for concurrent readers.  Cross-entry
+     * invariants are checked per member range, on first use (ensure_range). */
+    uint32_t n_chunks, n_pages;
+    uint64_t sec_off[3], sec_len[3]; uint32_t sec_crc[3];   /* dir.a, dir.a.max, dir.b */
+    uint32_t *pcrc[3];                                       /* per page */
+    lmap_chunk **pg_a; uint64_t **pg_ax; uint32_t **pg_bid; uint64_t **pg_bmax;
+    uint8_t *range_ok[2];                                    /* per member, set once checked */
+    uint64_t tot_runs, tot_bytes;
+    lmap_member *mem[2]; lmap_mrange *mrange[2]; uint32_t n_mem[2];
     uint32_t *by_name[2];
     uint64_t runs_off, runs_len; uint32_t runs_crc;
     struct xent { char *id; uint64_t off, len; uint32_t crc; } *xs; uint32_t n_xs;
@@ -872,7 +899,8 @@ static int parse_memdir(lmap_file *f, int axis, const uint8_t *p, size_t n) {
     const uint8_t *names = e + (size_t)cnt * LMAP_MEM_ENTRY;
     f->mem[axis] = calloc(cnt ? cnt : 1, sizeof *f->mem[axis]);
     f->by_name[axis] = calloc(cnt ? cnt : 1, sizeof **f->by_name);
-    if (!f->mem[axis] || !f->by_name[axis]) return -1;
+    f->mrange[axis] = calloc(cnt ? cnt : 1, sizeof **f->mrange);
+    if (!f->mem[axis] || !f->by_name[axis] || !f->mrange[axis]) return -1;
     f->n_mem[axis] = cnt;   /* set first: lmap_close must free whatever we allocated */
     for (uint32_t i = 0; i < cnt; i++, e += LMAP_MEM_ENTRY) {
         uint32_t noff = ld32(e), nlen = ld32(e + 4);
@@ -884,8 +912,8 @@ static int parse_memdir(lmap_file *f, int axis, const uint8_t *p, size_t n) {
         m->length   = ld64(e + 8);
         m->axis_min = ld64(e + 16);
         m->axis_max = ld64(e + 24);
-        m->first_chunk = ld32(e + 32);
-        m->n_chunks    = ld32(e + 36);
+        f->mrange[axis][i].first = ld32(e + 32);
+        f->mrange[axis][i].n     = ld32(e + 36);
     }
     /* by_name must be a permutation in strictly increasing name order: every name
      * lookup binary-searches it, names are unique, and groups are filled from it. */
@@ -941,9 +969,10 @@ lmap_file *lmap_open_io(lmap_io *io, int own_io) {
     /* Smallest possible entry is 1 id byte + 8 + 8 + 8 + 1 + 1 + 4 = 31 bytes.
      * Reject an inflated count before allocating anything for it. */
     if ((uint64_t)nsec * 31ull > flen) goto footfail;
-    uint8_t *dira = NULL, *dirax = NULL, *dirb = NULL, *ma = NULL, *mb = NULL;
+    uint8_t *dcrc = NULL, *ma = NULL, *mb = NULL;
     uint8_t *meta = NULL, *ga = NULL, *gb = NULL;
-    uint64_t dira_n = 0, dirax_n = 0, dirb_n = 0, ma_n = 0, mb_n = 0, meta_n = 0, ga_n = 0, gb_n = 0;
+    uint64_t dcrc_n = 0, ma_n = 0, mb_n = 0, meta_n = 0, ga_n = 0, gb_n = 0;
+    int seen_dir[3] = {0, 0, 0};
     int seen_runs = 0;
     for (uint32_t i = 0; i < nsec; i++) {
         if (end - p < 1) goto footfail;
@@ -959,9 +988,13 @@ lmap_file *lmap_open_io(lmap_io *io, int own_io) {
         if (scodec != LMAP_CODEC_NONE || sflags != 0 || sraw != sl) goto footfail;
 
         uint8_t **dst = NULL; uint64_t *dstn = NULL;
-        if      (!strcmp(id, "dir.a")) { dst = &dira; dstn = &dira_n; }
-        else if (!strcmp(id, "dir.a.max")) { dst = &dirax; dstn = &dirax_n; }
-        else if (!strcmp(id, "dir.b")) { dst = &dirb; dstn = &dirb_n; }
+        int dsec = !strcmp(id, "dir.a") ? 0 : !strcmp(id, "dir.a.max") ? 1 : !strcmp(id, "dir.b") ? 2 : -1;
+        if (dsec >= 0) {                          /* paged: located now, read on demand */
+            if (seen_dir[dsec]++) goto footfail;
+            f->sec_off[dsec] = so; f->sec_len[dsec] = sl; f->sec_crc[dsec] = scrc;
+            continue;
+        }
+        if      (!strcmp(id, "dir.crc")) { dst = &dcrc; dstn = &dcrc_n; }
         else if (!strcmp(id, "mem.a")) { dst = &ma;   dstn = &ma_n;   }
         else if (!strcmp(id, "mem.b")) { dst = &mb;   dstn = &mb_n;   }
         else if (!strcmp(id, "meta"))  { dst = &meta; dstn = &meta_n; }
@@ -995,130 +1028,54 @@ lmap_file *lmap_open_io(lmap_io *io, int own_io) {
     }
     free(foot); foot = NULL;
 
-    if (!dira || dira_n % LMAP_DIRA_ENTRY) goto tablefail;
-    if (!dirax || dirax_n != (dira_n / LMAP_DIRA_ENTRY) * 8) goto tablefail;
-    f->n_chunks = (uint32_t)(dira_n / LMAP_DIRA_ENTRY);
-    f->chunks = calloc(f->n_chunks ? f->n_chunks : 1, sizeof *f->chunks);
-    if (!f->chunks) goto tablefail;
-    for (uint32_t i = 0; i < f->n_chunks; i++) {
-        const uint8_t *e = dira + (size_t)i * LMAP_DIRA_ENTRY;
-        lmap_chunk *c = &f->chunks[i];
-        c->a_member = ld32(e);      c->b_member = ld32(e + 4);
-        c->a_min    = ld64(e + 8);  c->a_span   = ld32(e + 16);
-        c->b_span   = ld32(e + 20); c->b_min    = ld64(e + 24);
-        c->base     = ld64(e + 32); c->off      = ld64(e + 40);
-        c->clen     = ld32(e + 48); c->rawlen   = ld32(e + 52);
-        c->n_runs   = ld32(e + 56); c->codec = ld32(e + 60);
-        c->crc      = ld32(e + 64);
-        if (c->codec != LMAP_CODEC_NONE && c->codec != LMAP_CODEC_DEFLATE) goto tablefail;
-        if (ld32(e + 68) != 0) goto tablefail;              /* reserved */
-        /* n_runs sizes the decode buffer, so it must be answerable to the bytes that
-         * are actually there: every run costs at least one varint byte in each of the
-         * a, b and len streams plus a strand bit, after the 16-byte stream header.
-         * rawlen in turn must be reachable from clen. */
-        if (c->n_runs == 0 || c->n_runs > LMAP_MAX_CHUNK_RUNS) goto tablefail;
-        if (c->rawlen > LMAP_MAX_CHUNK_RAW) goto tablefail;
-        if ((uint64_t)c->rawlen < 16ull + 3ull * c->n_runs + (c->n_runs + 7ull) / 8) goto tablefail;
-        /* clen = 32 + stored bytes, rawlen = 16 + raw bytes, and stored <= raw per stream */
-        if (c->clen < 32) goto tablefail;
-        if (c->codec == LMAP_CODEC_NONE ? (uint64_t)c->clen != (uint64_t)c->rawlen + 16
-            : ((uint64_t)c->clen > (uint64_t)c->rawlen + 16 ||
-               (uint64_t)c->rawlen > (uint64_t)LMAP_ZLIB_MAX_RATIO * c->clen + 64)) goto tablefail;
-        if (c->off > f->runs_len || c->clen > f->runs_len - c->off) goto tablefail;
-        /* a_min, b_min and base become int64 decode bases. */
-        if (c->a_min > (uint64_t)INT64_MAX || c->b_min > (uint64_t)INT64_MAX ||
-            c->base > (uint64_t)INT64_MAX) goto tablefail;
-    }
-    f->dira_max = malloc((f->n_chunks ? f->n_chunks : 1) * sizeof *f->dira_max);
-    if (!f->dira_max) goto tablefail;
-    for (uint32_t i = 0; i < f->n_chunks; i++) f->dira_max[i] = ld64(dirax + (size_t)i * 8);
-    if (dirb && dirb_n == (uint64_t)f->n_chunks * LMAP_DIRB_ENTRY) {
-        f->dirb_id  = malloc((f->n_chunks ? f->n_chunks : 1) * sizeof *f->dirb_id);
-        f->dirb_max = malloc((f->n_chunks ? f->n_chunks : 1) * sizeof *f->dirb_max);
-        if (!f->dirb_id || !f->dirb_max) goto tablefail;
-        for (uint32_t i = 0; i < f->n_chunks; i++) {
-            const uint8_t *e = dirb + (size_t)i * LMAP_DIRB_ENTRY;
-            uint32_t id = ld32(e);
-            if (id >= f->n_chunks) goto tablefail;
-            f->dirb_id[i] = id; f->dirb_max[i] = ld64(e + 4);
+    /* dir.crc: u32 page_entries, u32 0, u64 n_chunks, u64 total runs, u64 payload bytes,
+     * then u32 CRC per page of dir.a, of dir.a.max, of dir.b */
+    if (!dcrc || dcrc_n < 32 || ld32(dcrc) != LMAP_DIR_PAGE || ld32(dcrc + 4) != 0) goto tablefail;
+    if (!seen_dir[0] || !seen_dir[1] || !seen_dir[2]) goto tablefail;
+    {
+        uint64_t nc = ld64(dcrc + 8);
+        if (nc > UINT32_MAX) goto tablefail;
+        f->n_chunks = (uint32_t)nc;
+        f->n_pages = (uint32_t)((nc + LMAP_DIR_PAGE - 1) / LMAP_DIR_PAGE);
+        f->tot_runs = ld64(dcrc + 16); f->tot_bytes = ld64(dcrc + 24);
+        if (dcrc_n != 32 + 3ull * f->n_pages * 4) goto tablefail;
+        if (f->sec_len[0] != nc * LMAP_DIRA_ENTRY || f->sec_len[1] != nc * 8 ||
+            f->sec_len[2] != nc * LMAP_DIRB_ENTRY) goto tablefail;
+        if (f->tot_bytes > f->runs_len || f->tot_runs > nc * (uint64_t)LMAP_MAX_CHUNK_RUNS) goto tablefail;
+        size_t np = f->n_pages ? f->n_pages : 1;
+        for (int k = 0; k < 3; k++) {
+            if (!(f->pcrc[k] = malloc(np * sizeof *f->pcrc[k]))) goto tablefail;
+            for (uint32_t pg = 0; pg < f->n_pages; pg++)
+                f->pcrc[k][pg] = ld32(dcrc + 32 + ((size_t)k * f->n_pages + pg) * 4);
         }
+        f->pg_a = calloc(np, sizeof *f->pg_a);     f->pg_ax = calloc(np, sizeof *f->pg_ax);
+        f->pg_bid = calloc(np, sizeof *f->pg_bid); f->pg_bmax = calloc(np, sizeof *f->pg_bmax);
+        if (!f->pg_a || !f->pg_ax || !f->pg_bid || !f->pg_bmax) goto tablefail;
     }
     if (ma && parse_memdir(f, 0, ma, (size_t)ma_n) != 0) goto tablefail;
     if (mb && parse_memdir(f, 1, mb, (size_t)mb_n) != 0) goto tablefail;
     if (!meta || parse_meta(f, meta, (size_t)meta_n) != 0) goto tablefail;
     if (ga && parse_groups(f, 0, ga, (size_t)ga_n) != 0) goto tablefail;
     if (gb && parse_groups(f, 1, gb, (size_t)gb_n) != 0) goto tablefail;
-    /* Every member id we hand to a caller must actually name a member. */
-    for (uint32_t i = 0; i < f->n_chunks; i++) {
-        if (f->chunks[i].a_member >= f->n_mem[0] ||
-            f->chunks[i].b_member >= f->n_mem[1]) goto tablefail;
-    }
-    /* The invariants the queries rely on, checked rather than trusted.  A file that
-     * violates any of them would make a binary search or an early exit silently
-     * return the wrong answer, which is worse than refusing to open it. */
+    /* Member ranges must tile each directory exactly; what is inside a range is checked
+     * when the range is first used (ensure_range), and all of it by lmap_verify. */
     for (int ax = 0; ax < 2; ax++) {
         uint64_t covered = 0;
         for (uint32_t i = 0; i < f->n_mem[ax]; i++) {
-            lmap_member *m = &f->mem[ax][i];
-            if (m->n_chunks > f->n_chunks ||
-                m->first_chunk > f->n_chunks - m->n_chunks) goto tablefail;
-            covered += m->n_chunks;
+            const lmap_mrange *m = &f->mrange[ax][i];
+            if (m->n > f->n_chunks || m->first > f->n_chunks - m->n) goto tablefail;
+            covered += m->n;
         }
-        if (f->n_chunks && covered != f->n_chunks) goto tablefail;
+        if (covered != f->n_chunks) goto tablefail;
+        if (!(f->range_ok[ax] = calloc(f->n_mem[ax] ? f->n_mem[ax] : 1, 1))) goto tablefail;
     }
-    /* mem.a ranges index dir.a: one member each, a_min increasing, extents disjoint */
-    for (uint32_t mi = 0; mi < f->n_mem[0]; mi++) {
-        const lmap_member *m = &f->mem[0][mi];
-        uint64_t run_max = 0;
-        for (uint32_t k = 0; k < m->n_chunks; k++) {
-            uint32_t pos = m->first_chunk + k;
-            const lmap_chunk *c = &f->chunks[pos];
-            uint64_t end = c->a_min + c->a_span;
-            if (c->a_member != mi) goto tablefail;
-            if (k) {
-                const lmap_chunk *pc = &f->chunks[pos - 1];
-                if (c->a_min < pc->a_min) goto tablefail;
-                /* order a cuts along a, so a member's chunks cannot overlap there */
-                if (f->order == LMAP_ORDER_A && c->a_min < pc->a_min + pc->a_span) goto tablefail;
-            }
-            if (end > m->length) goto tablefail;
-            if (k == 0 || end > run_max) run_max = end;
-            if (f->dira_max[pos] != run_max) goto tablefail;
-        }
-    }
-    if (f->dirb_id) {
-        /* dir.b must be a permutation of the chunk ids */
-        uint8_t *hit = calloc(f->n_chunks ? f->n_chunks : 1, 1);
-        if (!hit) goto tablefail;
-        for (uint32_t i = 0; i < f->n_chunks; i++) {
-            if (hit[f->dirb_id[i]]) { free(hit); goto tablefail; }
-            hit[f->dirb_id[i]] = 1;
-        }
-        free(hit);
-        /* mem.b ranges index dir.b: one member each, b_min non-decreasing, and the
-         * stored prefix max must equal the recomputed one, reset per member */
-        for (uint32_t mi = 0; mi < f->n_mem[1]; mi++) {
-            const lmap_member *m = &f->mem[1][mi];
-            uint64_t run_max = 0;
-            for (uint32_t k = 0; k < m->n_chunks; k++) {
-                uint32_t pos = m->first_chunk + k;
-                const lmap_chunk *c = &f->chunks[f->dirb_id[pos]];
-                if (c->b_member != mi) goto tablefail;
-                uint64_t end = c->b_min + c->b_span;
-                if (end > m->length) goto tablefail;
-                if (k && c->b_min < f->chunks[f->dirb_id[pos - 1]].b_min) goto tablefail;
-                if (k == 0 || end > run_max) run_max = end;
-                if (f->dirb_max[pos] != run_max) goto tablefail;
-            }
-        }
-    }
-    free(dira); free(dirax); free(dirb); free(ma); free(mb); free(meta); free(ga); free(gb);
+    free(dcrc); free(ma); free(mb); free(meta); free(ga); free(gb);
     return f;
 
 footfail:
     free(foot);
 tablefail:
-    free(dira); free(dirax); free(dirb); free(ma); free(mb); free(meta); free(ga); free(gb);
+    free(dcrc); free(ma); free(mb); free(meta); free(ga); free(gb);
 fail:
     lmap_close(f);      /* honours own_io, so a failed lmap_open_io(io,1) frees io */
     return NULL;
@@ -1134,9 +1091,17 @@ void lmap_close(lmap_file *f) {
     if (!f) return;
     for (int ax = 0; ax < 2; ax++) {
         for (uint32_t i = 0; i < f->n_mem[ax]; i++) free(f->mem[ax][i].name);
-        free(f->mem[ax]); free(f->by_name[ax]);
+        free(f->mem[ax]); free(f->by_name[ax]); free(f->mrange[ax]);
     }
-    free(f->chunks); free(f->dirb_id); free(f->dirb_max); free(f->dira_max);
+    for (uint32_t pg = 0; pg < f->n_pages; pg++) {
+        if (f->pg_a) free(f->pg_a[pg]);
+        if (f->pg_ax) free(f->pg_ax[pg]);
+        if (f->pg_bid) free(f->pg_bid[pg]);
+        if (f->pg_bmax) free(f->pg_bmax[pg]);
+    }
+    free(f->pg_a); free(f->pg_ax); free(f->pg_bid); free(f->pg_bmax);
+    for (int k = 0; k < 3; k++) free(f->pcrc[k]);
+    free(f->range_ok[0]); free(f->range_ok[1]);
     for (uint32_t i = 0; i < f->n_meta; i++) { free(f->meta[i].k); free(f->meta[i].v); }
     free(f->meta);
     for (int ax = 0; ax < 2; ax++) {
@@ -1205,6 +1170,168 @@ int lmap_group_members(const lmap_file *f, int axis, uint32_t g,
 }
 int         lmap_order(const lmap_file *f)       { return f ? f->order : -1; }
 int         lmap_a_overlap(const lmap_file *f)   { return f ? f->a_overlap : 0; }
+/* ---------------------------------------------------------------- directory pages */
+
+/* Decode and check one dir.a entry.  0 if it is well-formed. */
+static int parse_chunk_entry(const lmap_file *f, const uint8_t *e, lmap_chunk *c) {
+    c->a_member = ld32(e);      c->b_member = ld32(e + 4);
+    c->a_min    = ld64(e + 8);  c->a_span   = ld32(e + 16);
+    c->b_span   = ld32(e + 20); c->b_min    = ld64(e + 24);
+    c->base     = ld64(e + 32); c->off      = ld64(e + 40);
+    c->clen     = ld32(e + 48); c->rawlen   = ld32(e + 52);
+    c->n_runs   = ld32(e + 56); c->codec = ld32(e + 60);
+    c->crc      = ld32(e + 64);
+    if (c->codec != LMAP_CODEC_NONE && c->codec != LMAP_CODEC_DEFLATE) return -1;
+    if (ld32(e + 68) != 0) return -1;                   /* reserved */
+    /* Every member id handed to a caller must name a member. */
+    if (c->a_member >= f->n_mem[0] || c->b_member >= f->n_mem[1]) return -1;
+    /* n_runs sizes the decode buffer, so it must be answerable to the bytes that are
+     * actually there: every run costs at least one varint byte in each of the a, b and
+     * len streams plus a strand bit, after the 16-byte stream header.  rawlen in turn
+     * must be reachable from clen. */
+    if (c->n_runs == 0 || c->n_runs > LMAP_MAX_CHUNK_RUNS) return -1;
+    if (c->rawlen > LMAP_MAX_CHUNK_RAW) return -1;
+    if ((uint64_t)c->rawlen < 16ull + 3ull * c->n_runs + (c->n_runs + 7ull) / 8) return -1;
+    /* clen = 32 + stored bytes, rawlen = 16 + raw bytes, and stored <= raw per stream */
+    if (c->clen < 32) return -1;
+    if (c->codec == LMAP_CODEC_NONE ? (uint64_t)c->clen != (uint64_t)c->rawlen + 16
+        : ((uint64_t)c->clen > (uint64_t)c->rawlen + 16 ||
+           (uint64_t)c->rawlen > (uint64_t)LMAP_ZLIB_MAX_RATIO * c->clen + 64)) return -1;
+    if (c->off > f->runs_len || c->clen > f->runs_len - c->off) return -1;
+    /* a_min, b_min and base become int64 decode bases. */
+    if (c->a_min > (uint64_t)INT64_MAX || c->b_min > (uint64_t)INT64_MAX ||
+        c->base > (uint64_t)INT64_MAX) return -1;
+    return 0;
+}
+
+/* Make page pg of directory section sec (0 dir.a, 1 dir.a.max, 2 dir.b) resident:
+ * read it, check its CRC and every entry, and install it.  Two threads may race to
+ * load one page; the loser frees its copy.  0 on success. */
+static int load_page(lmap_file *f, int sec, uint32_t pg) {
+    void **slot = sec == 0 ? (void **)&f->pg_a[pg] : sec == 1 ? (void **)&f->pg_ax[pg]
+                                                              : (void **)&f->pg_bid[pg];
+    if (__atomic_load_n(slot, __ATOMIC_ACQUIRE)) return 0;
+    static const uint32_t es[3] = { LMAP_DIRA_ENTRY, 8, LMAP_DIRB_ENTRY };
+    uint64_t first = (uint64_t)pg * LMAP_DIR_PAGE;
+    uint32_t cnt = (uint32_t)(f->n_chunks - first < LMAP_DIR_PAGE ? f->n_chunks - first : LMAP_DIR_PAGE);
+    size_t bytes = (size_t)cnt * es[sec];
+    uint8_t *raw = malloc(bytes ? bytes : 1);
+    if (!raw) return -1;
+    if (lmap_pread(f->io, raw, (int64_t)(f->sec_off[sec] + first * es[sec]), (int64_t)bytes) != 0 ||
+        crc_all(raw, bytes) != f->pcrc[sec][pg]) { free(raw); return -1; }
+    void *page = NULL, *page2 = NULL;
+    int bad = 0;
+    if (sec == 0) {
+        lmap_chunk *c = malloc((size_t)cnt * sizeof *c);
+        if (!c) bad = 1;
+        for (uint32_t i = 0; !bad && i < cnt; i++) bad = parse_chunk_entry(f, raw + (size_t)i * es[0], &c[i]);
+        page = c;
+    } else if (sec == 1) {
+        uint64_t *m = malloc((size_t)cnt * sizeof *m);
+        if (!m) bad = 1;
+        for (uint32_t i = 0; !bad && i < cnt; i++) m[i] = ld64(raw + (size_t)i * 8);
+        page = m;
+    } else {
+        uint32_t *id = malloc((size_t)cnt * sizeof *id);
+        uint64_t *mx = malloc((size_t)cnt * sizeof *mx);
+        if (!id || !mx) bad = 1;
+        for (uint32_t i = 0; !bad && i < cnt; i++) {
+            id[i] = ld32(raw + (size_t)i * es[2]); mx[i] = ld64(raw + (size_t)i * es[2] + 4);
+            if (id[i] >= f->n_chunks) bad = 1;
+        }
+        page = id; page2 = mx;
+    }
+    free(raw);
+    if (bad) { free(page); free(page2); return -1; }
+    if (sec == 2) {                                       /* the max array first: readers */
+        void *exp = NULL;                                 /* test the id slot */
+        if (!__atomic_compare_exchange_n((void **)&f->pg_bmax[pg], &exp, page2, 0,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) free(page2);
+    }
+    void *exp = NULL;
+    if (!__atomic_compare_exchange_n(slot, &exp, page, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        free(page);
+    return 0;
+}
+
+static int load_pages(lmap_file *f, int sec, uint32_t first, uint32_t n) {
+    if (n == 0) return 0;
+    for (uint32_t pg = first / LMAP_DIR_PAGE; pg <= (first + n - 1) / LMAP_DIR_PAGE; pg++)
+        if (load_page(f, sec, pg)) return -1;
+    return 0;
+}
+
+/* Directory accessors, valid once the page is resident (callers ensure it).  Page
+ * slots are read with acquire loads: another thread may have installed the page, and
+ * this is what makes its contents visible here (a plain load on x86 all the same). */
+#define PAGE(arr, i) __atomic_load_n(&(arr)[(i) / LMAP_DIR_PAGE], __ATOMIC_ACQUIRE)[(i) % LMAP_DIR_PAGE]
+static inline const lmap_chunk *CH(const lmap_file *f, uint32_t cid) { return &PAGE(f->pg_a, cid); }
+static inline uint64_t DAX(const lmap_file *f, uint32_t pos)   { return PAGE(f->pg_ax, pos); }
+static inline uint32_t DBID(const lmap_file *f, uint32_t pos)  { return PAGE(f->pg_bid, pos); }
+static inline uint64_t DBMAX(const lmap_file *f, uint32_t pos) { return PAGE(f->pg_bmax, pos); }
+
+static int cmp_u32(const void *x, const void *y) {
+    uint32_t p = *(const uint32_t *)x, q = *(const uint32_t *)y;
+    return (p > q) - (p < q);
+}
+
+/* Load and check member m's range of its axis's directory, and the dir.a entries it
+ * names: the invariants the queries rely on, checked rather than trusted -- a violation
+ * would make a binary search or an early exit silently return the wrong answer.  Done
+ * once per member; 0 if the range is sound. */
+static int ensure_range(lmap_file *f, int ax, uint32_t mi) {
+    if (__atomic_load_n(&f->range_ok[ax][mi], __ATOMIC_ACQUIRE)) return 0;
+    const lmap_member *m = &f->mem[ax][mi];
+    const lmap_mrange *mr = &f->mrange[ax][mi];
+    uint64_t run_max = 0;
+    if (ax == 0) {
+        /* mem.a ranges index dir.a: one member each, a_min non-decreasing (and disjoint
+         * under order a, which cuts along a), dir.a.max the running max, reset per member */
+        if (load_pages(f, 0, mr->first, mr->n) || load_pages(f, 1, mr->first, mr->n)) return -1;
+        for (uint32_t k = 0; k < mr->n; k++) {
+            uint32_t pos = mr->first + k;
+            const lmap_chunk *c = CH(f, pos);
+            uint64_t end = c->a_min + c->a_span;
+            if (c->a_member != mi || end > m->length) return -1;
+            if (k) {
+                const lmap_chunk *pc = CH(f, pos - 1);
+                if (c->a_min < pc->a_min) return -1;
+                if (f->order == LMAP_ORDER_A && c->a_min < pc->a_min + pc->a_span) return -1;
+            }
+            if (k == 0 || end > run_max) run_max = end;
+            if (DAX(f, pos) != run_max) return -1;
+        }
+    } else {
+        /* mem.b ranges index dir.b: chunk ids naming this member, each once, b_min
+         * non-decreasing, dir.b's max the running max.  Every id carrying this member
+         * and appearing once per range, with the ranges tiling dir.b, is what makes
+         * dir.b a permutation of the chunk ids. */
+        if (load_pages(f, 2, mr->first, mr->n)) return -1;
+        uint32_t *ids = malloc((mr->n ? mr->n : 1) * sizeof *ids);
+        if (!ids) return -1;
+        int bad = 0;
+        for (uint32_t k = 0; !bad && k < mr->n; k++) {
+            uint32_t pos = mr->first + k, cid = DBID(f, pos);
+            ids[k] = cid;
+            if (load_page(f, 0, cid / LMAP_DIR_PAGE)) { bad = 1; break; }
+            const lmap_chunk *c = CH(f, cid);
+            uint64_t end = c->b_min + c->b_span;
+            if (c->b_member != mi || end > m->length) bad = 1;
+            if (k && c->b_min < CH(f, DBID(f, pos - 1))->b_min) bad = 1;
+            if (k == 0 || end > run_max) run_max = end;
+            if (DBMAX(f, pos) != run_max) bad = 1;
+        }
+        if (!bad && mr->n > 1) {
+            qsort(ids, mr->n, sizeof *ids, cmp_u32);
+            for (uint32_t k = 1; k < mr->n; k++) if (ids[k] == ids[k-1]) bad = 1;
+        }
+        free(ids);
+        if (bad) return -1;
+    }
+    __atomic_store_n(&f->range_ok[ax][mi], 1, __ATOMIC_RELEASE);
+    return 0;
+}
+
 uint32_t    lmap_n_chunks(const lmap_file *f)    { return f ? f->n_chunks : 0; }
 uint32_t    lmap_n_members(const lmap_file *f, int axis) {
     return (f && (axis == 0 || axis == 1)) ? f->n_mem[axis] : 0;
@@ -1214,7 +1341,8 @@ const lmap_member *lmap_member_at(const lmap_file *f, int axis, uint32_t i) {
     return &f->mem[axis][i];
 }
 const lmap_chunk *lmap_chunk_at(const lmap_file *f, uint32_t i) {
-    return (f && i < f->n_chunks) ? &f->chunks[i] : NULL;
+    if (!f || i >= f->n_chunks || load_page((lmap_file *)f, 0, i / LMAP_DIR_PAGE)) return NULL;
+    return CH(f, i);
 }
 
 int32_t lmap_member_by_name(const lmap_file *f, int axis, const char *name) {
@@ -1373,7 +1501,6 @@ static int cmp_hit_b(const void *x, const void *y) {
 
 int lmap_query_b(lmap_file *f, uint32_t m, int64_t lo, int64_t hi,
                  lmap_hit **out, size_t *n, lmap_query_stats *st) {
-    if (f && !f->dirb_id) return -1;                    /* no reverse index in this file */
     return query_via_cursor(f, 1, m, lo, hi, out, n, st, cmp_hit_b);
 }
 
@@ -1405,10 +1532,8 @@ typedef struct { dchunk *c; uint32_t i; } chead;
 struct lmap_cursor {
     lmap_file *f;
     int K;
-    uint32_t npos, id_base;
-    const uint32_t *ids;     /* chunk id per position; NULL: id_base + pos */
-    const uint64_t *pmax;    /* running max of key end per position */
-    uint32_t *own_ids; uint64_t *own_pmax;
+    uint32_t npos, base;     /* unfiltered: the key member's directory range */
+    uint32_t *own_ids; uint64_t *own_pmax;   /* filtered: the view's own copies */
     dchunk **htab; uint32_t hcap, hn;
     dchunk *lru_head, *lru_tail;
     size_t cached, budget;
@@ -1420,14 +1545,17 @@ struct lmap_cursor {
 };
 
 static inline uint32_t cur_cid(const lmap_cursor *c, uint32_t pos) {
-    return c->ids ? c->ids[pos] : c->id_base + pos;
+    return c->own_ids ? c->own_ids[pos] : c->K ? DBID(c->f, c->base + pos) : c->base + pos;
+}
+static inline uint64_t cur_pmax(const lmap_cursor *c, uint32_t pos) {
+    return c->own_pmax ? c->own_pmax[pos] : c->K ? DBMAX(c->f, c->base + pos) : DAX(c->f, c->base + pos);
 }
 static inline int64_t cur_kmin(const lmap_cursor *c, uint32_t pos) {
-    const lmap_chunk *k = &c->f->chunks[cur_cid(c, pos)];
+    const lmap_chunk *k = CH(c->f, cur_cid(c, pos));
     return (int64_t)(c->K ? k->b_min : k->a_min);
 }
 static inline int64_t cur_kend(const lmap_cursor *c, uint32_t pos) {
-    const lmap_chunk *k = &c->f->chunks[cur_cid(c, pos)];
+    const lmap_chunk *k = CH(c->f, cur_cid(c, pos));
     return (int64_t)(c->K ? k->b_min + k->b_span : k->a_min + k->a_span);
 }
 static inline int64_t rkey(const lmap_run *r, int K)   { return K ? r->b : r->a; }
@@ -1454,21 +1582,20 @@ static int cmp_keyed_id(const void *x, const void *y) {
 lmap_cursor *lmap_cursor_open(lmap_file *f, int key_axis, uint32_t key_member,
                               const uint32_t *other, uint32_t n_other, size_t cache_bytes) {
     if (!f || (key_axis != 0 && key_axis != 1) || key_member >= f->n_mem[key_axis]) return NULL;
-    if (key_axis == 1 && !f->dirb_id) return NULL;
     lmap_cursor *c = calloc(1, sizeof *c);
     if (!c) return NULL;
     c->f = f; c->K = key_axis; c->budget = cache_bytes;
-    const lmap_member *km = &f->mem[key_axis][key_member];
+    const lmap_mrange *km = &f->mrange[key_axis][key_member];
     if (!other) {
-        c->npos = km->n_chunks;
-        if (key_axis == 0) { c->id_base = km->first_chunk; c->pmax = f->dira_max + km->first_chunk; }
-        else { c->ids = f->dirb_id + km->first_chunk; c->pmax = f->dirb_max + km->first_chunk; }
+        /* the key member's range, loaded and checked; nothing else is touched */
+        if (ensure_range(f, key_axis, key_member)) { free(c); return NULL; }
+        c->npos = km->n; c->base = km->first;
     } else {
         int O = 1 - key_axis;
         uint64_t total = 0;
         for (uint32_t i = 0; i < n_other; i++) {
-            if (other[i] >= f->n_mem[O]) { free(c); return NULL; }
-            total += f->mem[O][other[i]].n_chunks;
+            if (other[i] >= f->n_mem[O] || ensure_range(f, O, other[i])) { free(c); return NULL; }
+            total += f->mrange[O][other[i]].n;
         }
         c->own_ids = malloc((total ? total : 1) * sizeof *c->own_ids);
         c->own_pmax = malloc((total ? total : 1) * sizeof *c->own_pmax);
@@ -1477,11 +1604,11 @@ lmap_cursor *lmap_cursor_open(lmap_file *f, int key_axis, uint32_t key_member,
         if (!kid) { lmap_cursor_close(c); return NULL; }
         uint32_t n = 0;
         for (uint32_t i = 0; i < n_other; i++) {
-            const lmap_member *om = &f->mem[O][other[i]];
-            for (uint32_t k = 0; k < om->n_chunks; k++) {
-                uint32_t pos = om->first_chunk + k;
-                uint32_t cid = O == 0 ? pos : f->dirb_id[pos];
-                const lmap_chunk *ch = &f->chunks[cid];
+            const lmap_mrange *om = &f->mrange[O][other[i]];
+            for (uint32_t k = 0; k < om->n; k++) {
+                uint32_t pos = om->first + k;
+                uint32_t cid = O == 0 ? pos : DBID(f, pos);
+                const lmap_chunk *ch = CH(f, cid);
                 if ((key_axis ? ch->b_member : ch->a_member) != key_member) continue;
                 kid[n].key = key_axis ? ch->b_min : ch->a_min; kid[n].cid = cid; n++;
             }
@@ -1489,14 +1616,13 @@ lmap_cursor *lmap_cursor_open(lmap_file *f, int key_axis, uint32_t key_member,
         if (n > 1) qsort(kid, n, sizeof *kid, cmp_keyed_id);
         for (uint32_t i = 0; i < n; i++) c->own_ids[i] = kid[i].cid;
         free(kid);
-        c->ids = c->own_ids; c->npos = n;
+        c->npos = n;
         uint64_t run = 0;
         for (uint32_t pos = 0; pos < n; pos++) {
             uint64_t e = (uint64_t)cur_kend(c, pos);
             if (pos == 0 || e > run) run = e;
             c->own_pmax[pos] = run;
         }
-        c->pmax = c->own_pmax;
     }
     c->hcap = 64;
     c->htab = calloc(c->hcap, sizeof *c->htab);
@@ -1555,7 +1681,7 @@ static dchunk *acquire(lmap_cursor *c, uint32_t pos, int64_t lo, int64_t hi) {
             return d;
         }
     uint32_t cid = cur_cid(c, pos);
-    const lmap_chunk *ch = &c->f->chunks[cid];
+    const lmap_chunk *ch = CH(c->f, cid);
     dchunk *d = calloc(1, sizeof *d);
     if (!d) return NULL;
     d->pos = pos; d->n = ch->n_runs;
@@ -1598,10 +1724,11 @@ static dchunk *acquire(lmap_cursor *c, uint32_t pos, int64_t lo, int64_t hi) {
     return d;
 }
 
-/* first index whose running max exceeds v (both arrays are non-decreasing) */
-static uint32_t first_above_u64(const uint64_t *a, uint32_t n, int64_t v) {
-    uint32_t lo = 0, hi = n;
-    while (lo < hi) { uint32_t m = lo + (hi - lo) / 2; if ((int64_t)a[m] > v) hi = m; else lo = m + 1; }
+/* first position >= from whose running max exceeds v (the running max is
+ * non-decreasing, so this is a binary search) */
+static uint32_t cur_first_above(const lmap_cursor *c, uint32_t from, int64_t v) {
+    uint32_t lo = from, hi = c->npos;
+    while (lo < hi) { uint32_t m = lo + (hi - lo) / 2; if ((int64_t)cur_pmax(c, m) > v) hi = m; else lo = m + 1; }
     return lo;
 }
 static uint32_t first_above_i64(const int64_t *a, uint32_t n, int64_t v) {
@@ -1610,14 +1737,16 @@ static uint32_t first_above_i64(const int64_t *a, uint32_t n, int64_t v) {
     return lo;
 }
 
-/* Same, searching forward from `hint` when it is a valid lower bound (a[hint-1] <= v):
- * a sweep of increasing v then finds each answer in O(log distance), not O(log n). */
-static uint32_t gallop_u64(const uint64_t *a, uint32_t n, int64_t v, uint32_t hint) {
-    if (hint > n || (hint > 0 && (int64_t)a[hint - 1] > v)) return first_above_u64(a, n, v);
+/* The same, searching forward from `hint` when it is a valid lower bound (its
+ * predecessor's max <= v): a sweep of increasing v then finds each answer in
+ * O(log distance), not O(log n). */
+static uint32_t cur_gallop(const lmap_cursor *c, int64_t v, uint32_t hint) {
+    if (hint > c->npos || (hint > 0 && (int64_t)cur_pmax(c, hint - 1) > v)) return cur_first_above(c, 0, v);
     uint32_t lo = hint, step = 1;
-    while (lo + step <= n && (int64_t)a[lo + step - 1] <= v) { lo += step; step *= 2; }
-    uint32_t hi = lo + step <= n ? lo + step : n;
-    return lo + first_above_u64(a + lo, hi - lo, v);
+    while (lo + step <= c->npos && (int64_t)cur_pmax(c, lo + step - 1) <= v) { lo += step; step *= 2; }
+    uint32_t hi = lo + step <= c->npos ? lo + step : c->npos;
+    while (lo < hi) { uint32_t m = lo + (hi - lo) / 2; if ((int64_t)cur_pmax(c, m) > v) hi = m; else lo = m + 1; }
+    return lo;
 }
 static uint32_t gallop_i64(const int64_t *a, uint32_t n, int64_t v, uint32_t hint) {
     if (hint > n || (hint > 0 && a[hint - 1] > v)) return first_above_i64(a, n, v);
@@ -1675,7 +1804,7 @@ int lmap_cursor_seek(lmap_cursor *c, int64_t lo, int64_t hi) {
     if (!c || lo < 0 || hi < lo) return -1;
     heap_clear(c);
     c->lo = lo; c->hi = hi;
-    c->next_pos = first_above_u64(c->pmax, c->npos, lo);   /* earlier chunks all end <= lo */
+    c->next_pos = cur_first_above(c, 0, lo);        /* earlier chunks all end <= lo */
     return 0;
 }
 
@@ -1737,7 +1866,7 @@ static int cmp_hit_key1(const void *x, const void *y) { return cmp_hit_key(x, y,
 int lmap_cursor_point(lmap_cursor *c, int64_t pos, lmap_hit *out, int cap) {
     if (!c || pos < 0 || cap < 0 || (cap > 0 && !out)) return -1;
     int count = 0;
-    uint32_t p0 = gallop_u64(c->pmax, c->npos, pos, c->point_hint);
+    uint32_t p0 = cur_gallop(c, pos, c->point_hint);
     c->point_hint = p0;
     for (uint32_t p = p0; p < c->npos; p++) {
         if (cur_kmin(c, p) > pos) break;
@@ -1772,7 +1901,7 @@ int lmap_cursor_extent(const lmap_cursor *c, int64_t *lo, int64_t *hi) {
     if (hi) *hi = 0;
     if (!c || c->npos == 0) return 0;
     if (lo) *lo = cur_kmin(c, 0);            /* positions are in key_min order */
-    if (hi) *hi = (int64_t)c->pmax[c->npos - 1];
+    if (hi) *hi = (int64_t)cur_pmax(c, c->npos - 1);
     return 1;
 }
 
@@ -1802,32 +1931,117 @@ int lmap_hit_clip(const lmap_hit *h, int axis, int64_t lo, int64_t hi, lmap_hit 
     return 1;
 }
 
+/* ================================================================ LIFT */
+
+int lmap_lift(lmap_file *f, int from, uint32_t m, int64_t lo, int64_t hi, int64_t max_gap,
+              lmap_lifted **out, size_t *n) {
+    if (!f || !out || !n || (from != 0 && from != 1)) return -1;
+    *out = NULL; *n = 0;
+    lmap_hit *h; size_t nh;
+    if ((from ? lmap_query_b(f, m, lo, hi, &h, &nh, NULL) : lmap_query_a(f, m, lo, hi, &h, &nh, NULL)) != 0)
+        return -1;
+    lmap_lifted *res = malloc((nh ? nh : 1) * sizeof *res);
+    if (!res) { free(h); return -1; }
+    /* the pieces arrive in source order; each open interval is extended by the first
+     * later piece that continues it within max_gap, else a new one starts */
+    size_t nr = 0;
+    size_t *open = malloc((nh ? nh : 1) * sizeof *open);   /* indices of intervals still open */
+    size_t nopen = 0;
+    if (!open) { free(h); free(res); return -1; }
+    for (size_t i = 0; i < nh; i++) {
+        const lmap_hit *x = &h[i];
+        uint32_t tm = from ? x->a_member : x->b_member;
+        int64_t s0 = from ? x->b : x->a, t0 = from ? x->a : x->b;
+        size_t hit = SIZE_MAX;
+        if (max_gap >= 0)
+            for (size_t k = 0; k < nopen && hit == SIZE_MAX; k++) {
+                lmap_lifted *r = &res[open[k]];
+                if (r->member != tm || r->strand != x->strand) continue;
+                int64_t sg = s0 - r->src_end;
+                int64_t tg = x->strand ? r->start - (t0 + x->len) : t0 - r->end;
+                if (sg >= 0 && sg <= max_gap && tg >= 0 && tg <= max_gap) hit = open[k];
+            }
+        if (hit != SIZE_MAX) {
+            lmap_lifted *r = &res[hit];
+            r->src_end = s0 + x->len;
+            if (x->strand) r->start = t0; else r->end = t0 + x->len;
+            r->aligned_bp += x->len;
+        } else {
+            lmap_lifted *r = &res[nr];
+            r->member = tm; r->strand = x->strand;
+            r->start = t0; r->end = t0 + x->len;
+            r->src_start = s0; r->src_end = s0 + x->len;
+            r->aligned_bp = x->len;
+            if (max_gap >= 0) open[nopen++] = nr;
+            nr++;
+        }
+        /* later pieces start at or after s0, so an interval ending more than max_gap
+         * before s0 can no longer grow */
+        size_t w = 0;
+        for (size_t k = 0; k < nopen; k++)
+            if (s0 - res[open[k]].src_end <= max_gap) open[w++] = open[k];
+        nopen = w;
+    }
+    free(open); free(h);
+    *out = res; *n = nr;
+    return 0;
+}
+
 /* ============================================= APPLICATION SECTIONS, NAME RANGES */
 
-int lmap_verify(lmap_file *f) {
-    if (!f) return -1;
+/* CRC of [off, off+len) of the file, streamed in bounded reads. */
+static int crc_range(lmap_file *f, uint64_t off, uint64_t len, uint32_t *out) {
     enum { STEP = 1 << 20 };
     uint8_t *buf = malloc(STEP);
     if (!buf) return -1;
     uLong crc = crc32(0L, Z_NULL, 0);
-    for (uint64_t done = 0; done < f->runs_len; ) {
-        uint64_t k = f->runs_len - done < STEP ? f->runs_len - done : STEP;
-        if (lmap_pread(f->io, buf, (int64_t)(f->runs_off + done), (int64_t)k) != 0) { free(buf); return -1; }
+    for (uint64_t done = 0; done < len; ) {
+        uint64_t k = len - done < STEP ? len - done : STEP;
+        if (lmap_pread(f->io, buf, (int64_t)(off + done), (int64_t)k) != 0) { free(buf); return -1; }
         crc = crc32(crc, buf, (uInt)k);
         done += k;
     }
     free(buf);
-    if ((uint32_t)crc != f->runs_crc) return -1;
-    for (uint32_t i = 0; i < f->n_chunks; i++) {
-        const lmap_chunk *c = &f->chunks[i];
-        uint8_t *raw = malloc(c->clen);
-        if (!raw) return -1;
-        int bad = lmap_pread(f->io, raw, (int64_t)(f->runs_off + c->off), (int64_t)c->clen) != 0 ||
-                  crc_all(raw, c->clen) != c->crc;
-        free(raw);
-        if (bad) return -1;
-    }
+    *out = (uint32_t)crc;
     return 0;
+}
+
+int lmap_verify(lmap_file *f) {
+    if (!f) return -1;
+    /* whole-section checksums of the payload and the paged directories */
+    uint32_t crc;
+    if (crc_range(f, f->runs_off, f->runs_len, &crc) || crc != f->runs_crc) return -1;
+    for (int k = 0; k < 3; k++)
+        if (crc_range(f, f->sec_off[k], f->sec_len[k], &crc) || crc != f->sec_crc[k]) return -1;
+    /* every member range of both axes: pages, entries and the cross-entry invariants */
+    for (int ax = 0; ax < 2; ax++)
+        for (uint32_t m = 0; m < f->n_mem[ax]; m++)
+            if (ensure_range(f, ax, m)) return -1;
+    /* every chunk: its checksum, then a full decode, whose runs must lie inside the
+     * chunk's directory extents (lmap_read_chunk checks both) -- and the totals */
+    lmap_run *runs = NULL; uint32_t cap = 0;
+    uint64_t nruns = 0, nbytes = 0;
+    for (uint32_t i = 0; i < f->n_chunks; i++) {
+        const lmap_chunk *c = CH(f, i);
+        nruns += c->n_runs; nbytes += c->clen;
+        if (c->n_runs > cap) {
+            lmap_run *nr = realloc(runs, (size_t)c->n_runs * sizeof *nr);
+            if (!nr) { free(runs); return -1; }
+            runs = nr; cap = c->n_runs;
+        }
+        if (lmap_read_chunk(f, i, runs) != 0) { free(runs); return -1; }
+    }
+    free(runs);
+    return (nruns == f->tot_runs && nbytes == f->tot_bytes) ? 0 : -1;
+}
+
+void lmap_get_stats(const lmap_file *f, lmap_file_stats *st) {
+    if (!st) return;
+    memset(st, 0, sizeof *st);
+    if (!f) return;
+    st->chunks = f->n_chunks;
+    st->runs = f->tot_runs;               /* recorded in dir.crc; lmap_verify checks them */
+    st->payload_bytes = f->tot_bytes;
 }
 
 uint32_t lmap_n_app_sections(const lmap_file *f) { return f ? f->n_xs : 0; }

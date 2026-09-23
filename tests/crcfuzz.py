@@ -37,6 +37,21 @@ def repair(buf):
             off,=struct.unpack_from('<Q',b,e+40); clen,=struct.unpack_from('<I',b,e+48)
             if rso+off+clen<=n:
                 struct.pack_into('<I',b,e+64, zlib.crc32(bytes(b[rso+off:rso+off+clen])) & 0xffffffff)
+    # then dir.crc's per-page CRCs over dir.a, dir.a.max, dir.b (dir.a holds the chunk
+    # CRCs just repaired): header u32 page, u32 0, u64 n, u64 runs, u64 bytes, then pages
+    if 'dir.crc' in sd and all(k in sd for k in ('dir.a','dir.a.max','dir.b')):
+        cso,csl=sd['dir.crc']
+        if cso+32<=n:
+            page,=struct.unpack_from('<I',b,cso); nch,=struct.unpack_from('<Q',b,cso+8)
+            if page and nch < 1<<32:
+                npg=(nch+page-1)//page
+                for k,(sid,es) in enumerate((('dir.a',72),('dir.a.max',8),('dir.b',12))):
+                    so,sl=sd[sid]
+                    for pg in range(npg):
+                        pos=cso+32+(k*npg+pg)*4
+                        lo_=so+pg*page*es; hi_=min(so+sl, lo_+page*es)
+                        if pos+4<=cso+csl and hi_<=n:
+                            struct.pack_into('<I',b,pos, zlib.crc32(bytes(b[lo_:hi_])) & 0xffffffff)
     for sid,so,sl,crcpos in secs:
         if so+sl>n: return None
         struct.pack_into('<I',b,crcpos, zlib.crc32(bytes(b[so:so+sl])) & 0xffffffff)

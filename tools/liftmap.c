@@ -4,7 +4,7 @@
  *   liftmap from-chain in.chain[.gz] out.lmap   [--swap] [--allow-overlap] [--group-sep C [--group-fields N]]
  *   liftmap to-paf     in.lmap [out.paf]        [--max-gap N]
  *   liftmap to-chain   in.lmap [out.chain]      [--max-gap N]
- *   liftmap lift       in.lmap in.bed [out.bed] [--from a|b]
+ *   liftmap lift       in.lmap in.bed [out.bed] [--from a|b] [--max-gap N] [--min-match F]
  *   liftmap coarsen    in.lmap out.lmap --max-gap N [--key a|b] [--mem BYTES] [--tmp-dir DIR]
  *   liftmap dump       in.lmap [out.tsv]
  *   liftmap info       in.lmap
@@ -19,7 +19,7 @@
  * kept, so export regroups the runs into records (--max-gap) and writes placeholder
  * scores.  A round trip preserves every aligned base pair exactly.
  */
-#include "../src/lmap_file.h"
+#include "../src/liftmap.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -421,11 +421,12 @@ static void export_records(lmap_file *f, FILE *o, int chain, int64_t max_gap) {
 
 /* ------------------------------------------------------------------ lift */
 
-static void lift_bed(lmap_file *f, const char *bed, FILE *o, int from_b) {
+static void lift_bed(lmap_file *f, const char *bed, FILE *o, int from_b, int64_t max_gap,
+                     double min_match) {
     reader r; reader_open(&r, bed);
     int src = from_b ? 1 : 0, dst = 1 - src;
     char *line, *fl[64];
-    int64_t nin = 0, nunmapped = 0, nout = 0;
+    int64_t nin = 0, nunmapped = 0, nout = 0, nlow = 0;
     while ((line = reader_line(&r))) {
         if (!*line || *line == '#' || !strncmp(line, "track", 5) || !strncmp(line, "browser", 7)) continue;
         int nf = split(line, fl, 64, 0);
@@ -434,28 +435,28 @@ static void lift_bed(lmap_file *f, const char *bed, FILE *o, int from_b) {
         if (s < 0 || e < s) die("%s:%" PRId64 ": bad interval", bed, r.lineno);
         nin++;
         int32_t m = lmap_member_by_name(f, src, fl[0]);
-        lmap_hit *h = NULL; size_t n = 0;
-        if (m >= 0 && (from_b ? lmap_query_b(f, (uint32_t)m, s, e, &h, &n, NULL)
-                              : lmap_query_a(f, (uint32_t)m, s, e, &h, &n, NULL)))
-            die("query failed on %s:%" PRId64 "-%" PRId64, fl[0], s, e);
-        if (n == 0) nunmapped++;
+        lmap_lifted *h = NULL; size_t n = 0;
+        if (m >= 0 && lmap_lift(f, src, (uint32_t)m, s, e, max_gap, &h, &n))
+            die("lift failed on %s:%" PRId64 "-%" PRId64, fl[0], s, e);
+        int64_t kept = 0;
         for (size_t k = 0; k < n; k++) {
-            const lmap_member *dm = lmap_member_at(f, dst, dst ? h[k].b_member : h[k].a_member);
-            int64_t ds = dst ? h[k].b : h[k].a;
-            fprintf(o, "%s\t%" PRId64 "\t%" PRId64, dm->name, ds, ds + h[k].len);
+            if (min_match > 0 && e > s && (double)h[k].aligned_bp < min_match * (double)(e - s)) { nlow++; continue; }
+            fprintf(o, "%s\t%" PRId64 "\t%" PRId64, lmap_member_at(f, dst, h[k].member)->name, h[k].start, h[k].end);
             for (int c = 3; c < nf; c++) {
                 const char *v = fl[c];
                 if (c == 5 && h[k].strand && (!strcmp(v, "+") || !strcmp(v, "-"))) v = v[0] == '+' ? "-" : "+";
                 fprintf(o, "\t%s", v);
             }
             fputc('\n', o);
-            nout++;
+            nout++; kept++;
         }
+        if (kept == 0) nunmapped++;
         free(h);
     }
     reader_close(&r);
-    fprintf(stderr, "liftmap: %" PRId64 " intervals in, %" PRId64 " unmapped, %" PRId64 " lifted pieces out\n",
-            nin, nunmapped, nout);
+    fprintf(stderr, "liftmap: %" PRId64 " intervals in, %" PRId64 " unmapped, %" PRId64 " lifted "
+            "intervals out%s", nin, nunmapped, nout, nlow ? "" : "\n");
+    if (nlow) fprintf(stderr, ", %" PRId64 " below --min-match\n", nlow);
 }
 
 /* ------------------------------------------------------------------ main */
@@ -468,7 +469,7 @@ static void usage(void) {
         "                     [--group-sep C [--group-fields N]] [--mem BYTES] [--tmp-dir DIR]\n"
         "  liftmap to-paf     in.lmap [out.paf]        [--max-gap N]\n"
         "  liftmap to-chain   in.lmap [out.chain]      [--max-gap N]\n"
-        "  liftmap lift       in.lmap in.bed [out.bed] [--from a|b]\n"
+        "  liftmap lift       in.lmap in.bed [out.bed] [--from a|b] [--max-gap N] [--min-match F]\n"
         "  liftmap coarsen    in.lmap out.lmap --max-gap N [--key a|b]\n"
         "  liftmap dump       in.lmap [out.tsv]\n"
         "  liftmap info       in.lmap\n"
@@ -480,6 +481,9 @@ static void usage(void) {
         "records joined across gaps of at most --max-gap bp (default 10000).\n"
         "Import holds --mem bytes of runs (default 1 GiB), then spills sorted runs to a\n"
         "temporary file in --tmp-dir (default: the output's directory).\n"
+        "lift writes one row per aligned piece; --max-gap N merges pieces on the same\n"
+        "target and strand across gaps of at most N bp on both axes, and --min-match F\n"
+        "drops a merged row whose aligned bases are under F of the input interval.\n"
         "coarsen chains runs across gaps of at most --max-gap bp on both axes into longer,\n"
         "approximate runs whose length is their span on the --key axis (default b).\n"
         "--group-sep C groups sequences into genomes by the name up to the N-th C\n"
@@ -505,6 +509,7 @@ int main(int argc, char **argv) {
     const char *tmp_dir = NULL;
     int64_t max_gap = 10000;
     int key_b = 1, gap_given = 0;
+    double min_match = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--swap")) swap = 1;
         else if (!strcmp(argv[i], "--allow-overlap")) allow_overlap = 1;
@@ -520,6 +525,7 @@ int main(int argc, char **argv) {
             if (group_fields < 1) usage();
         }
         else if (!strcmp(argv[i], "--max-gap") && i + 1 < argc) { max_gap = strtoll(argv[++i], NULL, 10); gap_given = 1; }
+        else if (!strcmp(argv[i], "--min-match") && i + 1 < argc) min_match = atof(argv[++i]);
         else if (!strcmp(argv[i], "--key") && i + 1 < argc) {
             const char *v = argv[++i];
             if (!strcmp(v, "a")) key_b = 0; else if (!strcmp(v, "b")) key_b = 1; else usage();
@@ -577,7 +583,7 @@ int main(int argc, char **argv) {
         if (npos < 2 || npos > 3) usage();
         lmap_file *f = open_or_die(pos[0]);
         FILE *o = open_out(pos[2]);
-        lift_bed(f, pos[1], o, from_b);
+        lift_bed(f, pos[1], o, from_b, gap_given ? max_gap : -1, min_match);
         close_out(o, pos[2]); lmap_close(f);
         return 0;
     }
@@ -601,12 +607,13 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "info")) {
         if (npos != 1) usage();
         lmap_file *f = open_or_die(pos[0]);
-        uint64_t runs = 0, bytes = 0;
-        for (uint32_t i = 0; i < lmap_n_chunks(f); i++) { runs += lmap_chunk_at(f, i)->n_runs; bytes += lmap_chunk_at(f, i)->clen; }
+        lmap_file_stats fs;
+        lmap_get_stats(f, &fs);
+        uint64_t runs = fs.runs, bytes = fs.payload_bytes;
         printf("profile\t%s\norder\t%c\naxis_a_overlaps\t%s\nsequences_a\t%u\nsequences_b\t%u\n"
                "chunks\t%u\nruns\t%" PRIu64 "\npayload_bytes\t%" PRIu64 "\nbytes_per_run\t%.3f\n",
                lmap_profile(f), lmap_order(f) == LMAP_ORDER_B ? 'b' : 'a', lmap_a_overlap(f) ? "yes" : "no",
-               lmap_n_members(f, 0), lmap_n_members(f, 1), lmap_n_chunks(f), runs, bytes,
+               lmap_n_members(f, 0), lmap_n_members(f, 1), fs.chunks, runs, bytes,
                runs ? (double)bytes / (double)runs : 0.0);
         for (uint32_t i = 0; i < lmap_meta_count(f); i++) {
             const char *k, *v;
@@ -626,11 +633,6 @@ int main(int argc, char **argv) {
         if (npos != 1) usage();
         lmap_file *f = open_or_die(pos[0]);
         int bad = lmap_verify(f) != 0;
-        for (uint32_t i = 0; !bad && i < lmap_n_chunks(f); i++) {
-            lmap_run *r = xmalloc(lmap_chunk_at(f, i)->n_runs * sizeof *r);
-            bad = lmap_read_chunk(f, i, r) != 0;
-            free(r);
-        }
         printf("%s\n", bad ? "CORRUPT" : "OK");
         lmap_close(f);
         return bad;

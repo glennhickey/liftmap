@@ -185,6 +185,58 @@ def coarsen_oracle(runs, key, gap, lens):
     rec = [dict(q=q, t=t, strand='-' if s else '+', pairs=[(a, b)]) for q, t, s, a, b in pairs]
     return canonical_runs(rec)[0]
 
+def lift_merge_check(label, lmap, pairs, seqs, side, rnd, gap, n=300):
+    """Lift windows with --max-gap and compare with the merge rule applied to the oracle's
+    pieces: per target sequence and strand, in source order, a piece extends an open
+    interval when the source gap and the target gap are both in [0, gap]."""
+    wins = []
+    for i in range(n):
+        s = rnd.choice(list(seqs)); w = rnd.choice([10, 200, 3000])
+        lo = rnd.randrange(max(1, seqs[s] - w)); wins.append((s, lo, min(seqs[s], lo + w)))
+    with tempfile.NamedTemporaryFile('w', suffix='.bed', delete=False) as f:
+        for i, (s, lo, hi) in enumerate(wins):
+            f.write(f'{s}\t{lo}\t{hi}\tw{i}\t0\t+\n')
+        bed = f.name
+    got = sorted(tuple(l.split('\t')[i] for i in (3, 0, 1, 2, 5))
+                 for l in run('lift', lmap, bed, '--from', side, '--max-gap', gap).stdout.splitlines())
+    os.unlink(bed)
+    by_src = {}
+    for q, t, st, a, b in pairs:
+        sq, sp, tq, tp = (q, a, t, b) if side == 'a' else (t, b, q, a)
+        by_src.setdefault(sq, []).append((sp, tq, tp, st))
+    want = []
+    for i, (s, lo, hi) in enumerate(wins):
+        bases = sorted(x for x in by_src.get(s, []) if lo <= x[0] < hi)
+        # pieces: maximal runs of consecutive source bases on one target diagonal
+        pieces = []
+        for sp, tq, tp, st in bases:
+            d = (sp + tp) if st else (tp - sp)
+            for pc in pieces:
+                if pc[1] == tq and pc[3] == st and pc[4] == d and pc[0] + pc[2] == sp:
+                    pc[2] += 1; break
+            else:
+                pieces.append([sp, tq, 1, st, d])
+        pieces = [(sp, tq, (d - sp - L + 1) if st else (d + sp), L, st) for sp, tq, L, st, d in pieces]
+        pieces.sort(key=lambda p: (p[0], p[2]))
+        res = []
+        for sp, tq, tp, L, st in pieces:
+            for r in res:
+                if r['tq'] != tq or r['st'] != st or not r['open']: continue
+                sg = sp - r['se']
+                tg = (r['ts'] - (tp + L)) if st else (tp - r['te'])
+                if 0 <= sg <= gap and 0 <= tg <= gap:
+                    r['se'] = sp + L
+                    if st: r['ts'] = tp
+                    else: r['te'] = tp + L
+                    break
+            else:
+                res.append(dict(tq=tq, st=st, ts=tp, te=tp + L, se=sp + L, open=True))
+            for r in res:
+                if sp - r['se'] > gap: r['open'] = False
+        for r in res:
+            want.append((f'w{i}', r['tq'], str(r['ts']), str(r['te']), '-' if r['st'] else '+'))
+    check(f'{label}: {len(want)} intervals merged at --max-gap {gap} match the oracle', got == sorted(want))
+
 def dump(lmap):
     out = run('dump', lmap).stdout
     return sorted((f[0], int(f[1]), f[2], int(f[3]), int(f[4]), f[5])
@@ -263,6 +315,9 @@ def main():
     run('from-paf', paf, S, '--swap', '--allow-overlap')
     swapped = sorted((t, b, q, a, L, s) for q, a, t, b, L, s in want)
     check('--swap exchanges the axes', dump(S) == sorted(swapped) or dump(S) == swapped)
+
+    lift_merge_check('merged lift a->b', L1, pairs, qseqs, 'a', rnd, 30)
+    lift_merge_check('merged lift b->a', L1, pairs, tseqs, 'b', rnd, 30)
 
     print('overlapping query (axis a may overlap):')
     recs = gen_records(rnd, qseqs, tseqs, 60, disjoint_q=False)

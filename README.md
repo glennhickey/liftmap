@@ -22,7 +22,7 @@ resolved.
 
 ## Status
 
-The C library implements the format in `doc/SPEC.md` (format major 2): a writer, and a
+The C library implements the format in `doc/SPEC.md` (format major 3): a writer, and a
 builder in front of it that takes runs in any order, reduces them to canonical maximal runs
 and chooses the storage order, spilling to a temporary file over a memory budget;
 coarsening (`lmap_coarsen`) for zoomed-out levels of detail; a reader with a cursor for
@@ -49,9 +49,14 @@ liftmap began as `libintervalmap`; its history is carried over.
    container without a format change.
 2. All I/O goes through one `pread(handle, buf, off, len)` seam. Local file, HTTP range,
    container slice and memory are the same code path.
-3. Open reads the trailer, footer and directories — never the payload.
+3. Open reads the trailer, footer and member directories — never the payload, and never
+   the chunk directories, which load a checksummed page at a time as queries need them
+   (0.2 ms to open a file of 288k chunks).
 4. Both axes are indexed from the same payload bytes.
 5. Extension slots are reserved up front (`aux.0`–`aux.3`).
+
+The public API is `src/liftmap.h`. `src/lmap_file.h` holds the internals (the writer the
+builder drives, the chunk directory, the codec) for the library and its tests.
 
 ## Command line
 

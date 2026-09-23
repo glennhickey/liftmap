@@ -23,7 +23,8 @@ Design rules this draft is required to honour:
 **History.** liftmap began as `libintervalmap` (prefix `imap_`, magic `IMAP`); its format 4
 is liftmap's format 1, renamed. Measurements below that mention `.lmap` files were taken
 under the old name. Format 2 replaced a free-text "schema" section with metadata (2.5) and
-added groups (2.4a).
+added groups (2.4a). Format 3 added per-page directory checksums (`dir.crc`, 2.3a) so a
+reader loads directories lazily.
 
 ---
 
@@ -213,7 +214,7 @@ Little-endian throughout. Sections are 8-byte aligned.
 ```
 HEADER  (64 B, at offset 0 — sized so format sniffers that read 64 bytes see all of it)
   0   u8[8]   magic  = "LMAP\x1A\x0D\x0A\x00"
-  8   u32     lmap_major         2; a reader requires an exact match
+  8   u32     lmap_major         3; a reader requires an exact match
   12  u32     lmap_minor         0
   16  u64     feature_flags      unknown bit set => reader MUST refuse
                                  bit 0: runs within a chunk are in order b
@@ -241,13 +242,18 @@ real order-a file made the reader open it as order b: the per-run containment ch
 rejected 11,199 of its 11,218 chunks, and the other 19 decoded without complaint into
 different runs.
 
-Open = `pread` the last 32 B, then `pread` the footer, then the directory sections. **The
-`runs` section is not read at open**: it is the one section whose size scales with the
-data, and an index is opened to touch a few chunks. Each chunk carries its own CRC in its
-directory entry, checked whenever the chunk is read. The `runs` section's own CRC in the
-section table is checked only by a full verification pass (`lmap_verify`, which streams it
-in bounded reads). An earlier version read and checksummed the whole payload at open, which
-cost 175 ms per open on the 228 MB rodent index; opening now takes 7 ms.
+Open = `pread` the last 32 B, then the footer, then the member directories, metadata,
+groups and `dir.crc`. **Neither the `runs` section nor the chunk directories are read at
+open**: both scale with the data, and an index is opened to touch a few members. Each chunk
+carries its own CRC in its directory entry, checked whenever the chunk is read; each page
+of the chunk directories has its own CRC in `dir.crc` (2.3a), checked when the page is
+loaded. The whole-section CRCs in the section table are checked only by a full verification
+pass (`lmap_verify`, which streams them in bounded reads).
+
+History: reading and checksumming the whole payload at open cost 175 ms per open on the
+228 MB rodent index; dropping that brought it to 7 ms. Reading the chunk directories still
+cost 21 ms at 288,047 chunks and would reach hundreds of MB per open at 577-way scale;
+paging them brought that to 0.2 ms.
 
 ### 2.1 Section table
 
@@ -364,10 +370,35 @@ order a additionally refuses overlapping extents within a member.
 **It resets at each member.** Members are separate coordinate spaces, so a bound carried
 over from the previous member would be meaningless; worse, it would be too large, which
 does not produce wrong answers but silently disables the early exit for the next member.
-A reader recomputes it at open and refuses a file whose stored values differ.
+A reader recomputes it (per member, on first use; 2.3a) and refuses a file whose stored
+values differ.
 Storing a permutation rather than a second copy of the runs was measured: a second
 parent-sorted payload costs +2.94 B/run and buys fan-out 1.00 against the cap's 1.48. Not
 worth it.
+
+### 2.3a `dir.crc` — per-page checksums, and lazy loading
+
+```
+  u32 page_entries                       4096
+  u32 reserved (0)
+  u64 n_chunks
+  u64 total_runs, payload_bytes          the directory's sums, so stats need no scan
+  u32 crc[n_pages]  for dir.a            n_pages = ceil(n_chunks / page_entries)
+  u32 crc[n_pages]  for dir.a.max
+  u32 crc[n_pages]  for dir.b
+```
+
+`dir.a`, `dir.a.max` and `dir.b` are read a page at a time: the page is loaded, checked
+against its CRC, and every entry in it checked on its own (2.2 limits, member ids, chunk ids
+in range), the first time anything needs it. A shared reader installs pages atomically, so
+concurrent readers stay safe. The invariants that span entries — a member's range carries
+that member, is sorted, has the recomputed running max, and (for `dir.b`) names each chunk
+once — are checked for a member's range the first time a cursor uses it, which is what the
+early exits need. Together with the ranges tiling each directory exactly (checked at open),
+the per-range checks imply the global ones: every chunk id in a `dir.b` range must carry
+that range's member, so no id can appear in two ranges. `lmap_verify` checks every range.
+A file whose directory is damaged therefore opens, and fails at the first query that
+touches the damage.
 
 ### 2.4 Member directory `mem.a` / `mem.b`
 

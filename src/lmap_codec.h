@@ -25,8 +25,7 @@
 /* Run order within a chunk (SPEC 1.3).  Order a: axis a is a uvarint delta from the
  * previous run's end and axis b follows the traversal (strand-aware).  Order b: runs
  * sorted by (b, a); both axes are zigzag deltas from the previous run's end. */
-#define LMAP_ORDER_A 0
-#define LMAP_ORDER_B 1
+#include "liftmap.h"      /* LMAP_ORDER_A / LMAP_ORDER_B */
 
 /* One run, in the coordinates of its chunk's members. */
 typedef struct {
