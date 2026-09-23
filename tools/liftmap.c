@@ -357,15 +357,19 @@ static void write_import(importer *im, const char *out, const char *profile,
 
 /* ------------------------------------------------------------------ export */
 
-typedef struct { lmap_hit *h; size_t n; } hitlist;
+/* Stream every run of axis-a member m in a order: a cursor that keeps no chunks, so
+ * memory is the chunks overlapping the current position, not the member. */
+static lmap_cursor *member_cursor(lmap_file *f, uint32_t m) {
+    lmap_cursor *c = lmap_cursor_open(f, 0, m, NULL, 0, 0);
+    if (!c || lmap_cursor_seek(c, 0, (int64_t)lmap_member_at(f, 0, m)->length))
+        die("cannot read %s", lmap_member_at(f, 0, m)->name);
+    return c;
+}
 
-/* Every run of axis-a member m, in (a, b) order. */
-static hitlist member_runs(lmap_file *f, uint32_t m) {
-    hitlist hl = {0};
-    const lmap_member *mem = lmap_member_at(f, 0, m);
-    if (lmap_query_a(f, m, 0, (int64_t)mem->length, &hl.h, &hl.n, NULL))
-        die("query failed on %s", mem->name);
-    return hl;
+static int next_run(lmap_cursor *c, lmap_hit *h) {
+    int rc = lmap_cursor_next(c, h);
+    if (rc < 0) die("corrupt chunk");
+    return rc;
 }
 
 /* Can hit y extend a record ending with hit x?  Same target, same strand, both axes
@@ -388,62 +392,64 @@ static void close_out(FILE *o, const char *path) {
     if (fflush(o) || (o != stdout && fclose(o))) die("error writing %s", path ? path : "stdout");
 }
 
-static void export_records(lmap_file *f, FILE *o, int chain, int64_t max_gap) {
-    uint32_t na = lmap_n_members(f, 0);
-    int64_t id = 0;
-    for (uint32_t rank = 0; rank < na; rank++) {
-        uint32_t m = (uint32_t)lmap_member_by_rank(f, 0, rank);
-        const lmap_member *am = lmap_member_at(f, 0, m);
-        hitlist hl = member_runs(f, m);
-        size_t i = 0;
-        while (i < hl.n) {
-            size_t j = i + 1;
-            while (j < hl.n && extends(&hl.h[j-1], &hl.h[j], max_gap)) j++;
-            const lmap_hit *h = hl.h;
-            const lmap_member *bm = lmap_member_at(f, 1, h[i].b_member);
-            int s = h[i].strand;
-            int64_t alen = 0;
-            for (size_t k = i; k < j; k++) alen += h[k].len;
-            int64_t a0 = h[i].a, a1 = h[j-1].a + h[j-1].len;
-            int64_t b0 = s ? h[j-1].b : h[i].b, b1 = s ? h[i].b + h[i].len : h[j-1].b + h[j-1].len;
-            if (chain) {
-                /* t = axis a (forward), q = axis b on the record's strand */
-                int64_t qs = s ? (int64_t)bm->length - b1 : b0, qe = s ? (int64_t)bm->length - b0 : b1;
-                fprintf(o, "chain %" PRId64 " %s %" PRIu64 " + %" PRId64 " %" PRId64 " %s %" PRIu64 " %c %"
-                        PRId64 " %" PRId64 " %" PRId64 "\n", alen, am->name, am->length, a0, a1,
-                        bm->name, bm->length, s ? '-' : '+', qs, qe, ++id);
-                for (size_t k = i; k < j; k++) {
-                    if (k + 1 < j) {
-                        int64_t dt = h[k+1].a - (h[k].a + h[k].len);
-                        int64_t dq = s ? h[k].b - (h[k+1].b + h[k+1].len) : h[k+1].b - (h[k].b + h[k].len);
-                        fprintf(o, "%" PRId64 "\t%" PRId64 "\t%" PRId64 "\n", h[k].len, dt, dq);
-                    } else fprintf(o, "%" PRId64 "\n\n", h[k].len);
-                }
-            } else {
-                /* PAF: query = axis a, target = axis b.  The CIGAR walks the target forward,
-                 * which on '-' visits the runs last to first. */
-                int64_t blen = 0;
-                fprintf(o, "%s\t%" PRIu64 "\t%" PRId64 "\t%" PRId64 "\t%c\t%s\t%" PRIu64 "\t%" PRId64 "\t%" PRId64,
-                        am->name, am->length, a0, a1, s ? '-' : '+', bm->name, bm->length, b0, b1);
-                /* block length = M + I + D */
-                blen = (a1 - a0) + (b1 - b0) - alen;
-                fprintf(o, "\t%" PRId64 "\t%" PRId64 "\t255\tcg:Z:", alen, blen);
-                for (size_t k = 0; k < j - i; k++) {
-                    size_t c = s ? j - 1 - k : i + k, nx = s ? c - 1 : c + 1;
-                    fprintf(o, "%" PRId64 "M", h[c].len);
-                    if (k + 1 < j - i) {
-                        int64_t dq = s ? h[c].a - (h[nx].a + h[nx].len) : h[nx].a - (h[c].a + h[c].len);
-                        int64_t dt = h[nx].b - (h[c].b + h[c].len);
-                        if (dq) fprintf(o, "%" PRId64 "I", dq);
-                        if (dt) fprintf(o, "%" PRId64 "D", dt);
-                    }
-                }
-                fputc('\n', o);
-            }
-            i = j;
+/* One record: runs that extend each other, written as a chain or a PAF line. */
+static void write_record(lmap_file *f, FILE *o, int chain, const lmap_hit *h, size_t n, int64_t id) {
+    const lmap_member *am = lmap_member_at(f, 0, h[0].a_member);
+    const lmap_member *bm = lmap_member_at(f, 1, h[0].b_member);
+    int s = h[0].strand;
+    int64_t alen = 0;
+    for (size_t k = 0; k < n; k++) alen += h[k].len;
+    int64_t a0 = h[0].a, a1 = h[n-1].a + h[n-1].len;
+    int64_t b0 = s ? h[n-1].b : h[0].b, b1 = s ? h[0].b + h[0].len : h[n-1].b + h[n-1].len;
+    if (chain) {
+        /* t = axis a (forward), q = axis b on the record's strand */
+        int64_t qs = s ? (int64_t)bm->length - b1 : b0, qe = s ? (int64_t)bm->length - b0 : b1;
+        fprintf(o, "chain %" PRId64 " %s %" PRIu64 " + %" PRId64 " %" PRId64 " %s %" PRIu64 " %c %"
+                PRId64 " %" PRId64 " %" PRId64 "\n", alen, am->name, am->length, a0, a1,
+                bm->name, bm->length, s ? '-' : '+', qs, qe, id);
+        for (size_t k = 0; k < n; k++) {
+            if (k + 1 < n) {
+                int64_t dt = h[k+1].a - (h[k].a + h[k].len);
+                int64_t dq = s ? h[k].b - (h[k+1].b + h[k+1].len) : h[k+1].b - (h[k].b + h[k].len);
+                fprintf(o, "%" PRId64 "\t%" PRId64 "\t%" PRId64 "\n", h[k].len, dt, dq);
+            } else fprintf(o, "%" PRId64 "\n\n", h[k].len);
         }
-        free(hl.h);
+        return;
     }
+    /* PAF: query = axis a, target = axis b.  The CIGAR walks the target forward, which on
+     * '-' visits the runs last to first.  Block length = M + I + D. */
+    fprintf(o, "%s\t%" PRIu64 "\t%" PRId64 "\t%" PRId64 "\t%c\t%s\t%" PRIu64 "\t%" PRId64 "\t%" PRId64
+            "\t%" PRId64 "\t%" PRId64 "\t255\tcg:Z:", am->name, am->length, a0, a1, s ? '-' : '+',
+            bm->name, bm->length, b0, b1, alen, (a1 - a0) + (b1 - b0) - alen);
+    for (size_t k = 0; k < n; k++) {
+        size_t c = s ? n - 1 - k : k, nx = s ? c - 1 : c + 1;
+        fprintf(o, "%" PRId64 "M", h[c].len);
+        if (k + 1 < n) {
+            int64_t dq = s ? h[c].a - (h[nx].a + h[nx].len) : h[nx].a - (h[c].a + h[c].len);
+            int64_t dt = h[nx].b - (h[c].b + h[c].len);
+            if (dq) fprintf(o, "%" PRId64 "I", dq);
+            if (dt) fprintf(o, "%" PRId64 "D", dt);
+        }
+    }
+    fputc('\n', o);
+}
+
+/* Regroup each member's runs into records, streaming: only the open record is held. */
+static void export_records(lmap_file *f, FILE *o, int chain, int64_t max_gap) {
+    int64_t id = 0;
+    lmap_hit *rec = NULL; size_t n = 0, cap = 0;
+    for (uint32_t rank = 0; rank < lmap_n_members(f, 0); rank++) {
+        lmap_cursor *c = member_cursor(f, (uint32_t)lmap_member_by_rank(f, 0, rank));
+        lmap_hit h;
+        while (next_run(c, &h)) {
+            if (n > 0 && !extends(&rec[n-1], &h, max_gap)) { write_record(f, o, chain, rec, n, ++id); n = 0; }
+            if (n == cap) { cap = cap ? cap * 2 : 256; rec = xrealloc(rec, cap * sizeof *rec); }
+            rec[n++] = h;
+        }
+        if (n > 0) { write_record(f, o, chain, rec, n, ++id); n = 0; }
+        lmap_cursor_close(c);
+    }
+    free(rec);
 }
 
 /* ------------------------------------------------------------------ lift */
@@ -562,13 +568,13 @@ int main(int argc, char **argv) {
         FILE *o = open_out(pos[1]);
         for (uint32_t rank = 0; rank < lmap_n_members(f, 0); rank++) {
             uint32_t m = (uint32_t)lmap_member_by_rank(f, 0, rank);
-            hitlist hl = member_runs(f, m);
-            for (size_t k = 0; k < hl.n; k++)
+            lmap_cursor *c = member_cursor(f, m);
+            lmap_hit h;
+            while (next_run(c, &h))
                 fprintf(o, "%s\t%" PRId64 "\t%s\t%" PRId64 "\t%" PRId64 "\t%c\n",
-                        lmap_member_at(f, 0, m)->name, hl.h[k].a,
-                        lmap_member_at(f, 1, hl.h[k].b_member)->name, hl.h[k].b, hl.h[k].len,
-                        hl.h[k].strand ? '-' : '+');
-            free(hl.h);
+                        lmap_member_at(f, 0, m)->name, h.a,
+                        lmap_member_at(f, 1, h.b_member)->name, h.b, h.len, h.strand ? '-' : '+');
+            lmap_cursor_close(c);
         }
         close_out(o, pos[1]); lmap_close(f);
         return 0;

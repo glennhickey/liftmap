@@ -453,6 +453,20 @@ gets `[o1, o2)` on the forward strand and `[len-o2, len-o1)` on the reverse stra
 Measured on the fish edge (9,010,509 runs, 5,575 parent scaffolds), mean chunks decoded per
 query: axis a 1.00 at a 2 bp window, 3.0 at 200 kb; axis b 1.35 at 2 bp, 2.3 at 200 kb.
 
+**Cursor.** Both queries are one-shot wrappers over a cursor, which is the general access
+path: one member of a key axis, optionally restricted to a set of members of the other axis
+(tui restricts the column axis to one genome's sequences). It returns whole runs in key
+order, ties broken by (other member, other position, len, strand), *across* chunks that
+overlap: chunks are opened in `key_min` order only as the merge reaches them, so a scan holds
+just the chunks overlapping its position. Decoded chunks are kept under a byte budget,
+least recently used first out; budget 0 streams. Point lookups use the same cache and search
+forward from the previous answer, so a per-position sweep costs O(1) per position. A cursor
+is single-threaded; the file is not, so concurrent readers each open their own.
+
+Measured through taffy on the rodent universal index against its previous ONEcode reader:
+per-column reverse lift 0.94–0.98× the time, range lift at parity, output identical except
+the order of paralogous matches at a column, which was unspecified and layout-dependent.
+
 ## 3. The two profiles
 
 ### 3.1 `hal2.edge` — a child genome onto its parent

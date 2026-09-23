@@ -165,4 +165,58 @@ int lmap_query_a(lmap_file *f, uint32_t m, int64_t lo, int64_t hi,
 int lmap_query_b(lmap_file *f, uint32_t m, int64_t lo, int64_t hi,
                  lmap_hit **out, size_t *n, lmap_query_stats *stats);
 
+/* ------------------------------------------------------------------ cursor
+ *
+ * A cursor walks one member of a KEY axis -- in key order, across chunks that overlap --
+ * optionally restricted to a set of members of the other axis (e.g. one genome's
+ * sequences).  It caches decoded chunks, so repeated point lookups and windows in one
+ * region decode each chunk once.
+ *
+ *   cache_bytes   budget for decoded chunks kept between calls, evicted least recently
+ *                 used first.  0 streams: a chunk is dropped as soon as the walk passes
+ *                 it, so a full scan holds only the chunks overlapping its position.
+ *                 LMAP_CACHE_ALL keeps everything decoded.
+ *
+ * Hits are whole runs (not clipped to the window; see lmap_hit_clip), ordered by
+ * (key position, other member, other position, len, strand).  A cursor is not
+ * thread-safe; the file it reads is, so use one cursor per thread. */
+
+#define LMAP_CACHE_ALL ((size_t)-1)
+
+typedef struct lmap_cursor lmap_cursor;
+
+typedef struct {
+    uint64_t chunks_examined;     /* directory entries considered */
+    uint64_t chunks_decoded;      /* chunks read and inflated */
+    uint64_t chunk_reuses;        /* lookups served from the cache */
+    size_t   cached_bytes, peak_cached_bytes;
+} lmap_cursor_stats;
+
+/* other = NULL for every member of the other axis, else n_other member ids to keep.
+ * NULL on bad arguments or no memory. */
+lmap_cursor *lmap_cursor_open(lmap_file *f, int key_axis, uint32_t key_member,
+                              const uint32_t *other, uint32_t n_other, size_t cache_bytes);
+
+/* Iterate the runs overlapping [lo, hi) on the key axis: seek, then next until it
+ * returns 0 (1 = *out filled, -1 = error).  Seek again at any time. */
+int  lmap_cursor_seek(lmap_cursor *c, int64_t lo, int64_t hi);
+int  lmap_cursor_next(lmap_cursor *c, lmap_hit *out);
+
+/* Every run covering key position pos.  Fills up to cap hits and returns how many
+ * there are in total (may exceed cap; then the ones filled are an arbitrary subset,
+ * so retry with a larger buffer), or -1 on error. */
+int  lmap_cursor_point(lmap_cursor *c, int64_t pos, lmap_hit *out, int cap);
+
+/* Key range the cursor's chunks cover, [*lo, *hi); 0 if it has none (then *lo = *hi = 0).
+ * From the directory: nothing is decoded. */
+int  lmap_cursor_extent(const lmap_cursor *c, int64_t *lo, int64_t *hi);
+uint32_t lmap_cursor_n_chunks(const lmap_cursor *c);
+
+void lmap_cursor_get_stats(const lmap_cursor *c, lmap_cursor_stats *stats);
+void lmap_cursor_close(lmap_cursor *c);
+
+/* Clip a hit to [lo, hi) on `axis`, mapping the other axis through the strand.  Returns
+ * 1 with *out filled, 0 if the hit does not overlap the window. */
+int  lmap_hit_clip(const lmap_hit *h, int axis, int64_t lo, int64_t hi, lmap_hit *out);
+
 #endif /* LMAP_FILE_H */

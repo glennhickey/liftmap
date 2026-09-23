@@ -1059,25 +1059,6 @@ static int hit_push(hitvec *v, const lmap_hit *h) {
 }
 
 /* Decode chunk ci and append its runs' overlaps with [lo,hi) on `axis`. */
-static int scan_chunk(lmap_file *f, uint32_t ci, int axis, int64_t lo, int64_t hi,
-                      lmap_run **buf, uint32_t *bufn, hitvec *out, lmap_query_stats *st) {
-    const lmap_chunk *c = &f->chunks[ci];
-    if (c->n_runs > *bufn) {
-        lmap_run *nb = realloc(*buf, (size_t)c->n_runs * sizeof *nb);
-        if (!nb) return -1;
-        *buf = nb; *bufn = c->n_runs;
-    }
-    if (lmap_read_chunk(f, ci, *buf) != 0) return -1;
-    if (st) st->chunks_decoded++;
-    for (uint32_t k = 0; k < c->n_runs; k++) {
-        lmap_hit h;
-        if (!clip_run(&(*buf)[k], axis, lo, hi, &h)) continue;
-        h.a_member = c->a_member; h.b_member = c->b_member;
-        if (hit_push(out, &h) != 0) return -1;
-    }
-    return 0;
-}
-
 static int cmp_hit_a(const void *x, const void *y) {
     const lmap_hit *p = (const lmap_hit *)x, *q = (const lmap_hit *)y;
     /* a alone is unique unless the file declares A_OVERLAP; the rest keeps that case
@@ -1088,36 +1069,38 @@ static int cmp_hit_a(const void *x, const void *y) {
     return (int)p->strand - (int)q->strand;
 }
 
-int lmap_query_a(lmap_file *f, uint32_t m, int64_t lo, int64_t hi,
-                 lmap_hit **out, size_t *n, lmap_query_stats *st) {
-    if (!f || !out || !n || m >= f->n_mem[0] || lo < 0 || hi < lo) return -1;
+/* The one-shot queries: a streaming cursor over the window, clipped, in their
+ * documented orders. */
+static int query_via_cursor(lmap_file *f, int axis, uint32_t m, int64_t lo, int64_t hi,
+                            lmap_hit **out, size_t *n, lmap_query_stats *st,
+                            int (*cmp)(const void *, const void *)) {
+    if (!f || !out || !n || m >= f->n_mem[axis] || lo < 0 || hi < lo) return -1;
     *out = NULL; *n = 0;
     if (st) memset(st, 0, sizeof *st);
-    const lmap_member *mem = &f->mem[0][m];
-    uint32_t first = mem->first_chunk, end = mem->first_chunk + mem->n_chunks;
-    /* last dir.a position in this member with a_min < hi */
-    uint32_t lo_i = first, hi_i = end;
-    while (lo_i < hi_i) {
-        uint32_t mid = lo_i + (hi_i - lo_i) / 2;
-        if ((int64_t)f->chunks[mid].a_min < hi) lo_i = mid + 1; else hi_i = mid;
+    lmap_cursor *c = lmap_cursor_open(f, axis, m, NULL, 0, 0);
+    if (!c) return -1;
+    hitvec v = {0};
+    lmap_hit h, t;
+    int rc = lmap_cursor_seek(c, lo, hi);
+    while (rc == 0 && (rc = lmap_cursor_next(c, &h)) == 1) {
+        rc = 0;
+        if (lmap_hit_clip(&h, axis, lo, hi, &t) && hit_push(&v, &t) != 0) rc = -1;
     }
-    hitvec v = {0}; lmap_run *buf = NULL; uint32_t bufn = 0; int rc = 0;
-    /* Walk backwards; dir.a.max bounds a_end of every chunk at or before a position.
-     * Under order a the member's chunks are disjoint and this stops after one step;
-     * under order b they overlap and the walk covers exactly the ones that might. */
-    for (uint32_t j = lo_i; j > first; j--) {
-        uint32_t pos = j - 1;
-        if ((int64_t)f->dira_max[pos] <= lo) break;
-        const lmap_chunk *c = &f->chunks[pos];
-        if (st) st->chunks_examined++;
-        if ((int64_t)(c->a_min + c->a_span) <= lo) continue;
-        if (scan_chunk(f, pos, 0, lo, hi, &buf, &bufn, &v, st) != 0) { rc = -1; break; }
+    if (st) {
+        lmap_cursor_stats cs; lmap_cursor_get_stats(c, &cs);
+        st->chunks_examined = (uint32_t)cs.chunks_examined;
+        st->chunks_decoded = (uint32_t)cs.chunks_decoded;
     }
-    free(buf);
+    lmap_cursor_close(c);
     if (rc != 0) { free(v.p); return -1; }
-    if (v.n > 1) qsort(v.p, v.n, sizeof *v.p, cmp_hit_a);
+    if (v.n > 1) qsort(v.p, v.n, sizeof *v.p, cmp);
     *out = v.p; *n = v.n;
     return 0;
+}
+
+int lmap_query_a(lmap_file *f, uint32_t m, int64_t lo, int64_t hi,
+                 lmap_hit **out, size_t *n, lmap_query_stats *st) {
+    return query_via_cursor(f, 0, m, lo, hi, out, n, st, cmp_hit_a);
 }
 
 static int cmp_hit_b(const void *x, const void *y) {
@@ -1130,35 +1113,433 @@ static int cmp_hit_b(const void *x, const void *y) {
 
 int lmap_query_b(lmap_file *f, uint32_t m, int64_t lo, int64_t hi,
                  lmap_hit **out, size_t *n, lmap_query_stats *st) {
-    if (!f || !out || !n || m >= f->n_mem[1] || lo < 0 || hi < lo) return -1;
-    if (!f->dirb_id) return -1;                         /* no reverse index in this file */
-    *out = NULL; *n = 0;
-    if (st) memset(st, 0, sizeof *st);
-    const lmap_member *mem = &f->mem[1][m];
-    uint32_t first = mem->first_chunk, end = mem->first_chunk + mem->n_chunks;
-    /* last dir.b position in this member with b_min < hi */
-    uint32_t lo_i = first, hi_i = end;
-    while (lo_i < hi_i) {
-        uint32_t mid = lo_i + (hi_i - lo_i) / 2;
-        if ((int64_t)f->chunks[f->dirb_id[mid]].b_min < hi) lo_i = mid + 1; else hi_i = mid;
+    if (f && !f->dirb_id) return -1;                    /* no reverse index in this file */
+    return query_via_cursor(f, 1, m, lo, hi, out, n, st, cmp_hit_b);
+}
+
+/* ================================================================ CURSOR
+ *
+ * A view is the key member's chunks in key_min order with a running max of key_end --
+ * borrowed straight from the file's directory, or, when the other axis is filtered to a
+ * set of members, gathered from those members' directory ranges and sorted.  Iteration
+ * merges the runs of every chunk overlapping the window with a heap, opening a chunk
+ * only once the merge reaches its key_min, so runs come out in key order across chunks
+ * that overlap, and at most the overlapping chunks are held at once.  Decoded chunks are
+ * cached under a byte budget, least recently used first out; a chunk in use by the
+ * iteration is pinned and never evicted. */
+
+typedef struct dchunk {
+    uint32_t pos, other_member, key_member;
+    lmap_run *runs;          /* sorted by (key, other, len, strand) */
+    int64_t  *mep;           /* running max of key end */
+    uint32_t  n;
+    size_t    bytes;
+    int       pins;
+    int       partial;       /* holds only the runs of one window: never reused */
+    uint32_t  hint;          /* last point lookup's first index, for sweeps */
+    struct dchunk *prev, *next, *hnext;
+} dchunk;
+
+typedef struct { dchunk *c; uint32_t i; } chead;
+
+struct lmap_cursor {
+    lmap_file *f;
+    int K;
+    uint32_t npos, id_base;
+    const uint32_t *ids;     /* chunk id per position; NULL: id_base + pos */
+    const uint64_t *pmax;    /* running max of key end per position */
+    uint32_t *own_ids; uint64_t *own_pmax;
+    dchunk **htab; uint32_t hcap, hn;
+    dchunk *lru_head, *lru_tail;
+    size_t cached, budget;
+    int64_t lo, hi;
+    uint32_t next_pos;
+    uint32_t point_hint;     /* last point lookup's first position, for sweeps */
+    chead *heap; uint32_t nheap, capheap;
+    lmap_cursor_stats st;
+};
+
+static inline uint32_t cur_cid(const lmap_cursor *c, uint32_t pos) {
+    return c->ids ? c->ids[pos] : c->id_base + pos;
+}
+static inline int64_t cur_kmin(const lmap_cursor *c, uint32_t pos) {
+    const lmap_chunk *k = &c->f->chunks[cur_cid(c, pos)];
+    return (int64_t)(c->K ? k->b_min : k->a_min);
+}
+static inline int64_t cur_kend(const lmap_cursor *c, uint32_t pos) {
+    const lmap_chunk *k = &c->f->chunks[cur_cid(c, pos)];
+    return (int64_t)(c->K ? k->b_min + k->b_span : k->a_min + k->a_span);
+}
+static inline int64_t rkey(const lmap_run *r, int K)   { return K ? r->b : r->a; }
+static inline int64_t rother(const lmap_run *r, int K) { return K ? r->a : r->b; }
+
+/* qsort takes no context, and a global would race between threads: one comparator per
+ * key axis instead. */
+static int cmp_run_key(const lmap_run *p, const lmap_run *q, int K) {
+    if (rkey(p, K) != rkey(q, K)) return rkey(p, K) < rkey(q, K) ? -1 : 1;
+    if (rother(p, K) != rother(q, K)) return rother(p, K) < rother(q, K) ? -1 : 1;
+    if (p->len != q->len) return p->len < q->len ? -1 : 1;
+    return (int)p->strand - (int)q->strand;
+}
+static int cmp_run_key0(const void *x, const void *y) { return cmp_run_key(x, y, 0); }
+static int cmp_run_key1(const void *x, const void *y) { return cmp_run_key(x, y, 1); }
+
+typedef struct { uint64_t key; uint32_t cid; } keyed_id;
+static int cmp_keyed_id(const void *x, const void *y) {
+    const keyed_id *p = x, *q = y;
+    if (p->key != q->key) return p->key < q->key ? -1 : 1;
+    return p->cid < q->cid ? -1 : p->cid > q->cid;
+}
+
+lmap_cursor *lmap_cursor_open(lmap_file *f, int key_axis, uint32_t key_member,
+                              const uint32_t *other, uint32_t n_other, size_t cache_bytes) {
+    if (!f || (key_axis != 0 && key_axis != 1) || key_member >= f->n_mem[key_axis]) return NULL;
+    if (key_axis == 1 && !f->dirb_id) return NULL;
+    lmap_cursor *c = calloc(1, sizeof *c);
+    if (!c) return NULL;
+    c->f = f; c->K = key_axis; c->budget = cache_bytes;
+    const lmap_member *km = &f->mem[key_axis][key_member];
+    if (!other) {
+        c->npos = km->n_chunks;
+        if (key_axis == 0) { c->id_base = km->first_chunk; c->pmax = f->dira_max + km->first_chunk; }
+        else { c->ids = f->dirb_id + km->first_chunk; c->pmax = f->dirb_max + km->first_chunk; }
+    } else {
+        int O = 1 - key_axis;
+        uint64_t total = 0;
+        for (uint32_t i = 0; i < n_other; i++) {
+            if (other[i] >= f->n_mem[O]) { free(c); return NULL; }
+            total += f->mem[O][other[i]].n_chunks;
+        }
+        c->own_ids = malloc((total ? total : 1) * sizeof *c->own_ids);
+        c->own_pmax = malloc((total ? total : 1) * sizeof *c->own_pmax);
+        if (!c->own_ids || !c->own_pmax) { lmap_cursor_close(c); return NULL; }
+        keyed_id *kid = malloc((total ? total : 1) * sizeof *kid);
+        if (!kid) { lmap_cursor_close(c); return NULL; }
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < n_other; i++) {
+            const lmap_member *om = &f->mem[O][other[i]];
+            for (uint32_t k = 0; k < om->n_chunks; k++) {
+                uint32_t pos = om->first_chunk + k;
+                uint32_t cid = O == 0 ? pos : f->dirb_id[pos];
+                const lmap_chunk *ch = &f->chunks[cid];
+                if ((key_axis ? ch->b_member : ch->a_member) != key_member) continue;
+                kid[n].key = key_axis ? ch->b_min : ch->a_min; kid[n].cid = cid; n++;
+            }
+        }
+        if (n > 1) qsort(kid, n, sizeof *kid, cmp_keyed_id);
+        for (uint32_t i = 0; i < n; i++) c->own_ids[i] = kid[i].cid;
+        free(kid);
+        c->ids = c->own_ids; c->npos = n;
+        uint64_t run = 0;
+        for (uint32_t pos = 0; pos < n; pos++) {
+            uint64_t e = (uint64_t)cur_kend(c, pos);
+            if (pos == 0 || e > run) run = e;
+            c->own_pmax[pos] = run;
+        }
+        c->pmax = c->own_pmax;
     }
-    hitvec v = {0}; lmap_run *buf = NULL; uint32_t bufn = 0; int rc = 0;
-    /* Walk backwards. prefix_max[j] bounds the b_end of every chunk at or before j in
-     * this member, so once it is <= lo nothing earlier can overlap: stop. */
-    for (uint32_t j = lo_i; j > first; j--) {
-        uint32_t pos = j - 1;
-        if ((int64_t)f->dirb_max[pos] <= lo) break;
-        uint32_t ci = f->dirb_id[pos];
-        const lmap_chunk *c = &f->chunks[ci];
-        if (st) st->chunks_examined++;
-        if ((int64_t)(c->b_min + c->b_span) <= lo) continue;
-        if (scan_chunk(f, ci, 1, lo, hi, &buf, &bufn, &v, st) != 0) { rc = -1; break; }
+    c->hcap = 64;
+    c->htab = calloc(c->hcap, sizeof *c->htab);
+    if (!c->htab) { lmap_cursor_close(c); return NULL; }
+    c->lo = c->hi = 0; c->next_pos = c->npos;
+    return c;
+}
+
+static void lru_remove(lmap_cursor *c, dchunk *d) {
+    if (d->prev) d->prev->next = d->next; else if (c->lru_head == d) c->lru_head = d->next;
+    if (d->next) d->next->prev = d->prev; else if (c->lru_tail == d) c->lru_tail = d->prev;
+    d->prev = d->next = NULL;
+}
+
+static void dchunk_free_unhash(lmap_cursor *c, dchunk *d) {
+    dchunk **pp = &c->htab[d->pos & (c->hcap - 1)];
+    while (*pp && *pp != d) pp = &(*pp)->hnext;
+    if (*pp) *pp = d->hnext;
+    c->hn--; c->cached -= d->bytes;
+    free(d->runs); free(d->mep); free(d);
+}
+
+static void evict(lmap_cursor *c) {
+    while (c->cached > c->budget && c->lru_tail) {
+        dchunk *d = c->lru_tail;
+        lru_remove(c, d);
+        dchunk_free_unhash(c, d);
     }
-    free(buf);
-    if (rc != 0) { free(v.p); return -1; }
-    if (v.n > 1) qsort(v.p, v.n, sizeof *v.p, cmp_hit_b);   /* qsort(NULL, 0) is UB */
-    *out = v.p; *n = v.n;
+}
+
+static void release(lmap_cursor *c, dchunk *d) {
+    if (--d->pins > 0) return;
+    d->next = c->lru_head; d->prev = NULL;
+    if (c->lru_head) c->lru_head->prev = d; else c->lru_tail = d;
+    c->lru_head = d;
+    evict(c);
+}
+
+static int hash_grow(lmap_cursor *c) {
+    uint32_t nc = c->hcap * 2;
+    dchunk **nt = calloc(nc, sizeof *nt);
+    if (!nt) return -1;
+    for (uint32_t i = 0; i < c->hcap; i++)
+        for (dchunk *d = c->htab[i], *nx; d; d = nx) { nx = d->hnext; d->hnext = nt[d->pos & (nc - 1)]; nt[d->pos & (nc - 1)] = d; }
+    free(c->htab); c->htab = nt; c->hcap = nc;
     return 0;
+}
+
+/* The decoded chunk at view position pos, pinned, holding at least the runs overlapping
+ * [lo, hi) on the key axis.  NULL on error. */
+static dchunk *acquire(lmap_cursor *c, uint32_t pos, int64_t lo, int64_t hi) {
+    for (dchunk *d = c->htab[pos & (c->hcap - 1)]; d; d = d->hnext)
+        if (d->pos == pos && !d->partial) {
+            if (d->pins++ == 0) lru_remove(c, d);
+            c->st.chunk_reuses++;
+            return d;
+        }
+    uint32_t cid = cur_cid(c, pos);
+    const lmap_chunk *ch = &c->f->chunks[cid];
+    dchunk *d = calloc(1, sizeof *d);
+    if (!d) return NULL;
+    d->pos = pos; d->n = ch->n_runs;
+    d->key_member = c->K ? ch->b_member : ch->a_member;
+    d->other_member = c->K ? ch->a_member : ch->b_member;
+    d->runs = malloc((size_t)d->n * sizeof *d->runs);
+    d->mep = malloc((size_t)d->n * sizeof *d->mep);
+    if (!d->runs || !d->mep || lmap_read_chunk(c->f, cid, d->runs) != 0) {
+        free(d->runs); free(d->mep); free(d); return NULL;
+    }
+    /* Stored order is sorted on the file's order axis -- by (a) under order a, by
+     * (b, a, len, strand) under order b, which is already key order when the key is the
+     * order axis.  Only the other case needs sorting. */
+    if (c->f->order != c->K) {
+        /* A cursor that keeps nothing needs only this window's runs, and sorting a whole
+         * chunk to use a few of them dominated tui's forward queries. */
+        if (c->budget == 0) {
+            uint32_t m = 0;
+            for (uint32_t i = 0; i < d->n; i++) {
+                int64_t k = rkey(&d->runs[i], c->K);
+                if (k < hi && k + d->runs[i].len > lo) d->runs[m++] = d->runs[i];
+            }
+            d->n = m; d->partial = 1;
+        }
+        qsort(d->runs, d->n, sizeof *d->runs, c->K ? cmp_run_key1 : cmp_run_key0);
+    }
+    int64_t run = 0;
+    for (uint32_t i = 0; i < d->n; i++) {
+        int64_t e = rkey(&d->runs[i], c->K) + d->runs[i].len;
+        if (i == 0 || e > run) run = e;
+        d->mep[i] = run;
+    }
+    d->bytes = sizeof *d + (size_t)d->n * (sizeof *d->runs + sizeof *d->mep);
+    d->pins = 1;
+    if ((c->hn + 1) * 2 > c->hcap && hash_grow(c) != 0) { free(d->runs); free(d->mep); free(d); return NULL; }
+    d->hnext = c->htab[pos & (c->hcap - 1)]; c->htab[pos & (c->hcap - 1)] = d;
+    c->hn++; c->cached += d->bytes;
+    if (c->cached > c->st.peak_cached_bytes) c->st.peak_cached_bytes = c->cached;
+    c->st.chunks_decoded++;
+    return d;
+}
+
+/* first index whose running max exceeds v (both arrays are non-decreasing) */
+static uint32_t first_above_u64(const uint64_t *a, uint32_t n, int64_t v) {
+    uint32_t lo = 0, hi = n;
+    while (lo < hi) { uint32_t m = lo + (hi - lo) / 2; if ((int64_t)a[m] > v) hi = m; else lo = m + 1; }
+    return lo;
+}
+static uint32_t first_above_i64(const int64_t *a, uint32_t n, int64_t v) {
+    uint32_t lo = 0, hi = n;
+    while (lo < hi) { uint32_t m = lo + (hi - lo) / 2; if (a[m] > v) hi = m; else lo = m + 1; }
+    return lo;
+}
+
+/* Same, searching forward from `hint` when it is a valid lower bound (a[hint-1] <= v):
+ * a sweep of increasing v then finds each answer in O(log distance), not O(log n). */
+static uint32_t gallop_u64(const uint64_t *a, uint32_t n, int64_t v, uint32_t hint) {
+    if (hint > n || (hint > 0 && (int64_t)a[hint - 1] > v)) return first_above_u64(a, n, v);
+    uint32_t lo = hint, step = 1;
+    while (lo + step <= n && (int64_t)a[lo + step - 1] <= v) { lo += step; step *= 2; }
+    uint32_t hi = lo + step <= n ? lo + step : n;
+    return lo + first_above_u64(a + lo, hi - lo, v);
+}
+static uint32_t gallop_i64(const int64_t *a, uint32_t n, int64_t v, uint32_t hint) {
+    if (hint > n || (hint > 0 && a[hint - 1] > v)) return first_above_i64(a, n, v);
+    uint32_t lo = hint, step = 1;
+    while (lo + step <= n && a[lo + step - 1] <= v) { lo += step; step *= 2; }
+    uint32_t hi = lo + step <= n ? lo + step : n;
+    return lo + first_above_i64(a + lo, hi - lo, v);
+}
+
+/* heap order = output order: key, other member, other position, len, strand, chunk */
+static int head_less(const lmap_cursor *c, const chead *x, const chead *y) {
+    const lmap_run *p = &x->c->runs[x->i], *q = &y->c->runs[y->i];
+    int K = c->K;
+    if (rkey(p, K) != rkey(q, K)) return rkey(p, K) < rkey(q, K);
+    if (x->c->other_member != y->c->other_member) return x->c->other_member < y->c->other_member;
+    if (rother(p, K) != rother(q, K)) return rother(p, K) < rother(q, K);
+    if (p->len != q->len) return p->len < q->len;
+    if (p->strand != q->strand) return p->strand < q->strand;
+    return x->c->pos < y->c->pos;
+}
+static void heap_up(lmap_cursor *c, uint32_t i) {
+    while (i > 0) {
+        uint32_t p = (i - 1) / 2;
+        if (!head_less(c, &c->heap[i], &c->heap[p])) break;
+        chead t = c->heap[i]; c->heap[i] = c->heap[p]; c->heap[p] = t; i = p;
+    }
+}
+static void heap_down(lmap_cursor *c, uint32_t i) {
+    for (;;) {
+        uint32_t l = 2 * i + 1, r = l + 1, m = i;
+        if (l < c->nheap && head_less(c, &c->heap[l], &c->heap[m])) m = l;
+        if (r < c->nheap && head_less(c, &c->heap[r], &c->heap[m])) m = r;
+        if (m == i) break;
+        chead t = c->heap[i]; c->heap[i] = c->heap[m]; c->heap[m] = t; i = m;
+    }
+}
+
+/* Move h->i to the next run overlapping [lo, hi); 0 if the chunk has none left. */
+static int head_valid(const lmap_cursor *c, chead *h) {
+    for (; h->i < h->c->n; h->i++) {
+        const lmap_run *r = &h->c->runs[h->i];
+        int64_t k = rkey(r, c->K);
+        if (k >= c->hi) return 0;
+        if (k + r->len > c->lo) return 1;
+    }
+    return 0;
+}
+
+static void heap_clear(lmap_cursor *c) {
+    for (uint32_t i = 0; i < c->nheap; i++) release(c, c->heap[i].c);
+    c->nheap = 0;
+}
+
+int lmap_cursor_seek(lmap_cursor *c, int64_t lo, int64_t hi) {
+    if (!c || lo < 0 || hi < lo) return -1;
+    heap_clear(c);
+    c->lo = lo; c->hi = hi;
+    c->next_pos = first_above_u64(c->pmax, c->npos, lo);   /* earlier chunks all end <= lo */
+    return 0;
+}
+
+int lmap_cursor_next(lmap_cursor *c, lmap_hit *out) {
+    if (!c || !out) return -1;
+    for (;;) {
+        /* open every chunk that could hold a run at or before the current minimum */
+        while (c->next_pos < c->npos) {
+            int64_t km = cur_kmin(c, c->next_pos);
+            if (km >= c->hi) { c->next_pos = c->npos; break; }
+            if (c->nheap && km > rkey(&c->heap[0].c->runs[c->heap[0].i], c->K)) break;
+            uint32_t pos = c->next_pos++;
+            c->st.chunks_examined++;
+            if (cur_kend(c, pos) <= c->lo) continue;
+            dchunk *d = acquire(c, pos, c->lo, c->hi);
+            if (!d) return -1;
+            chead h = { d, first_above_i64(d->mep, d->n, c->lo) };
+            if (!head_valid(c, &h)) { release(c, d); continue; }
+            if (c->nheap == c->capheap) {
+                uint32_t cap = c->capheap ? c->capheap * 2 : 16;
+                chead *nh = realloc(c->heap, cap * sizeof *nh);
+                if (!nh) { release(c, d); return -1; }
+                c->heap = nh; c->capheap = cap;
+            }
+            c->heap[c->nheap++] = h;
+            heap_up(c, c->nheap - 1);
+        }
+        if (c->nheap == 0) return 0;
+        chead *h = &c->heap[0];
+        const lmap_run *r = &h->c->runs[h->i];
+        out->a = r->a; out->b = r->b; out->len = r->len; out->strand = r->strand;
+        out->a_member = c->K ? h->c->other_member : h->c->key_member;
+        out->b_member = c->K ? h->c->key_member : h->c->other_member;
+        h->i++;
+        if (head_valid(c, h)) heap_down(c, 0);
+        else {
+            dchunk *d = h->c;
+            c->heap[0] = c->heap[--c->nheap];
+            if (c->nheap) heap_down(c, 0);
+            release(c, d);
+        }
+        return 1;
+    }
+}
+
+static int cmp_hit_key(const lmap_hit *p, const lmap_hit *q, int K) {
+    int64_t kp = K ? p->b : p->a, kq = K ? q->b : q->a;
+    if (kp != kq) return kp < kq ? -1 : 1;
+    uint32_t mp = K ? p->a_member : p->b_member, mq = K ? q->a_member : q->b_member;
+    if (mp != mq) return mp < mq ? -1 : 1;
+    int64_t op = K ? p->a : p->b, oq = K ? q->a : q->b;
+    if (op != oq) return op < oq ? -1 : 1;
+    if (p->len != q->len) return p->len < q->len ? -1 : 1;
+    return (int)p->strand - (int)q->strand;
+}
+static int cmp_hit_key0(const void *x, const void *y) { return cmp_hit_key(x, y, 0); }
+static int cmp_hit_key1(const void *x, const void *y) { return cmp_hit_key(x, y, 1); }
+
+int lmap_cursor_point(lmap_cursor *c, int64_t pos, lmap_hit *out, int cap) {
+    if (!c || pos < 0 || cap < 0 || (cap > 0 && !out)) return -1;
+    int count = 0;
+    uint32_t p0 = gallop_u64(c->pmax, c->npos, pos, c->point_hint);
+    c->point_hint = p0;
+    for (uint32_t p = p0; p < c->npos; p++) {
+        if (cur_kmin(c, p) > pos) break;
+        c->st.chunks_examined++;
+        if (cur_kend(c, p) <= pos) continue;
+        dchunk *d = acquire(c, p, pos, pos + 1);
+        if (!d) return -1;
+        uint32_t i0 = gallop_i64(d->mep, d->n, pos, d->hint);
+        d->hint = i0;
+        for (uint32_t i = i0; i < d->n; i++) {
+            const lmap_run *r = &d->runs[i];
+            if (rkey(r, c->K) > pos) break;
+            if (rkey(r, c->K) + r->len <= pos) continue;
+            if (count < cap) {
+                lmap_hit *h = &out[count];
+                h->a = r->a; h->b = r->b; h->len = r->len; h->strand = r->strand;
+                h->a_member = c->K ? d->other_member : d->key_member;
+                h->b_member = c->K ? d->key_member : d->other_member;
+            }
+            count++;
+        }
+        release(c, d);
+    }
+    if (count > 1 && cap > 0) {
+        qsort(out, (size_t)(count < cap ? count : cap), sizeof *out, c->K ? cmp_hit_key1 : cmp_hit_key0);
+    }
+    return count;
+}
+
+int lmap_cursor_extent(const lmap_cursor *c, int64_t *lo, int64_t *hi) {
+    if (lo) *lo = 0;
+    if (hi) *hi = 0;
+    if (!c || c->npos == 0) return 0;
+    if (lo) *lo = cur_kmin(c, 0);            /* positions are in key_min order */
+    if (hi) *hi = (int64_t)c->pmax[c->npos - 1];
+    return 1;
+}
+
+uint32_t lmap_cursor_n_chunks(const lmap_cursor *c) { return c ? c->npos : 0; }
+
+void lmap_cursor_get_stats(const lmap_cursor *c, lmap_cursor_stats *st) {
+    if (c && st) { *st = c->st; st->cached_bytes = c->cached; }
+}
+
+void lmap_cursor_close(lmap_cursor *c) {
+    if (!c) return;
+    heap_clear(c);
+    if (c->htab)
+        for (uint32_t i = 0; i < c->hcap; i++)
+            for (dchunk *d = c->htab[i], *nx; d; d = nx) { nx = d->hnext; free(d->runs); free(d->mep); free(d); }
+    free(c->htab); free(c->heap); free(c->own_ids); free(c->own_pmax);
+    free(c);
+}
+
+int lmap_hit_clip(const lmap_hit *h, int axis, int64_t lo, int64_t hi, lmap_hit *out) {
+    if (!h || !out || (axis != 0 && axis != 1)) return 0;
+    lmap_run r = { h->a, h->b, h->len, h->strand };
+    lmap_hit t;
+    if (!clip_run(&r, axis, lo, hi, &t)) return 0;
+    t.a_member = h->a_member; t.b_member = h->b_member;
+    *out = t;
+    return 1;
 }
 
 /* ============================================= APPLICATION SECTIONS, NAME RANGES */
