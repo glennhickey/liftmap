@@ -4,7 +4,7 @@ CFLAGS  ?= -std=c99 -O2 -g -Wall -Wextra
 CPPFLAGS += -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE
 LDLIBS  += -lz
 
-SRC  = src/lmap_codec.c src/lmap_io.c src/lmap_file.c src/lmap_build.c
+SRC  = src/lmap_codec.c src/lmap_io.c src/lmap_file.c src/lmap_build.c src/lmap_chain.c
 OBJ  = $(SRC:.c=.o)
 LIB  = libliftmap.a
 TESTBINS = bin/xcheck bin/roundtrip bin/robust bin/query bin/fuzz_reader bin/sections

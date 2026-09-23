@@ -4,7 +4,7 @@
  *   liftmap from-chain in.chain[.gz] out.lmap   [--swap] [--allow-overlap] [--group-sep C [--group-fields N]]
  *   liftmap to-paf     in.lmap [out.paf]        [--max-gap N]
  *   liftmap to-chain   in.lmap [out.chain]      [--max-gap N]
- *   liftmap lift       in.lmap in.bed [out.bed] [--from a|b] [--max-gap N] [--min-match F]
+ *   liftmap lift       in.lmap in.bed [out.bed] [--from a|b] [--max-gap N] [--min-match F] [--best F]
  *   liftmap coarsen    in.lmap out.lmap --max-gap N [--key a|b] [--mem BYTES] [--tmp-dir DIR]
  *   liftmap dump       in.lmap [out.tsv]
  *   liftmap info       in.lmap
@@ -421,8 +421,8 @@ static void export_records(lmap_file *f, FILE *o, int chain, int64_t max_gap) {
 
 /* ------------------------------------------------------------------ lift */
 
-static void lift_bed(lmap_file *f, const char *bed, FILE *o, int from_b, int64_t max_gap,
-                     double min_match) {
+static void lift_bed(lmap_file *f, const char *bed, FILE *o, int from_b,
+                     const lmap_lift_opts *lo, double min_match) {
     reader r; reader_open(&r, bed);
     int src = from_b ? 1 : 0, dst = 1 - src;
     char *line, *fl[64];
@@ -436,7 +436,7 @@ static void lift_bed(lmap_file *f, const char *bed, FILE *o, int from_b, int64_t
         nin++;
         int32_t m = lmap_member_by_name(f, src, fl[0]);
         lmap_lifted *h = NULL; size_t n = 0;
-        if (m >= 0 && lmap_lift(f, src, (uint32_t)m, s, e, max_gap, &h, &n))
+        if (m >= 0 && lmap_lift(f, src, (uint32_t)m, s, e, lo, &h, &n))
             die("lift failed on %s:%" PRId64 "-%" PRId64, fl[0], s, e);
         int64_t kept = 0;
         for (size_t k = 0; k < n; k++) {
@@ -470,6 +470,7 @@ static void usage(void) {
         "  liftmap to-paf     in.lmap [out.paf]        [--max-gap N]\n"
         "  liftmap to-chain   in.lmap [out.chain]      [--max-gap N]\n"
         "  liftmap lift       in.lmap in.bed [out.bed] [--from a|b] [--max-gap N] [--min-match F]\n"
+        "                     [--best F [--chain-open N --chain-extend N --chain-max-gap N]]\n"
         "  liftmap coarsen    in.lmap out.lmap --max-gap N [--key a|b]\n"
         "  liftmap dump       in.lmap [out.tsv]\n"
         "  liftmap info       in.lmap\n"
@@ -484,6 +485,9 @@ static void usage(void) {
         "lift writes one row per aligned piece; --max-gap N merges pieces on the same\n"
         "target and strand across gaps of at most N bp on both axes, and --min-match F\n"
         "drops a merged row whose aligned bases are under F of the input interval.\n"
+        "--best F keeps the best copy where the input lands more than once: pieces are\n"
+        "chained, and a chain whose source overlaps better chains by more than F of its\n"
+        "own is dropped (0 = strict, one target per base; liftOver's behaviour).\n"
         "coarsen chains runs across gaps of at most --max-gap bp on both axes into longer,\n"
         "approximate runs whose length is their span on the --key axis (default b).\n"
         "--group-sep C groups sequences into genomes by the name up to the N-th C\n"
@@ -509,7 +513,8 @@ int main(int argc, char **argv) {
     const char *tmp_dir = NULL;
     int64_t max_gap = 10000;
     int key_b = 1, gap_given = 0;
-    double min_match = 0;
+    double min_match = 0, best = -1;
+    int64_t chain_open = 0, chain_extend = 1, chain_max_gap = 10000000;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--swap")) swap = 1;
         else if (!strcmp(argv[i], "--allow-overlap")) allow_overlap = 1;
@@ -526,6 +531,10 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--max-gap") && i + 1 < argc) { max_gap = strtoll(argv[++i], NULL, 10); gap_given = 1; }
         else if (!strcmp(argv[i], "--min-match") && i + 1 < argc) min_match = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--best") && i + 1 < argc) { best = atof(argv[++i]); if (best < 0 || best > 1) usage(); }
+        else if (!strcmp(argv[i], "--chain-open") && i + 1 < argc) chain_open = strtoll(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--chain-extend") && i + 1 < argc) chain_extend = strtoll(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--chain-max-gap") && i + 1 < argc) chain_max_gap = strtoll(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--key") && i + 1 < argc) {
             const char *v = argv[++i];
             if (!strcmp(v, "a")) key_b = 0; else if (!strcmp(v, "b")) key_b = 1; else usage();
@@ -583,7 +592,11 @@ int main(int argc, char **argv) {
         if (npos < 2 || npos > 3) usage();
         lmap_file *f = open_or_die(pos[0]);
         FILE *o = open_out(pos[2]);
-        lift_bed(f, pos[1], o, from_b, gap_given ? max_gap : -1, min_match);
+        lmap_lift_opts lo = LMAP_LIFT_OPTS_DEFAULT;
+        lo.max_gap = gap_given ? max_gap : -1;
+        lo.overlap_frac = best;
+        lo.chain.chain_open = chain_open; lo.chain.chain_extend = chain_extend; lo.chain.max_gap = chain_max_gap;
+        lift_bed(f, pos[1], o, from_b, &lo, min_match);
         close_out(o, pos[2]); lmap_close(f);
         return 0;
     }

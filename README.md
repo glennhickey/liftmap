@@ -25,7 +25,8 @@ resolved.
 The C library implements the format in `doc/SPEC.md` (format major 3): a writer, and a
 builder in front of it that takes runs in any order, reduces them to canonical maximal runs
 and chooses the storage order, spilling to a temporary file over a memory budget;
-coarsening (`lmap_coarsen`) for zoomed-out levels of detail; a reader with a cursor for
+coarsening (`lmap_coarsen`) for zoomed-out levels of detail; lifting with an optional
+paralogy filter (`lmap_lift`, `lmap_chain`, `lmap_chain_select`); a reader with a cursor for
 key-ordered and point access from either axis; metadata, groups (e.g. a
 genome's sequences), application sections, and a `pread` I/O seam over files, memory and
 container slices. `ref/liftmap.py` is a Python reference for the run codec and chunking.
@@ -66,7 +67,7 @@ liftmap from-chain in.chain[.gz] out.lmap   [--swap] [--allow-overlap] [--group-
                    (both also take [--mem BYTES] [--tmp-dir DIR])
 liftmap to-paf     in.lmap [out.paf]        [--max-gap N]
 liftmap to-chain   in.lmap [out.chain]      [--max-gap N]
-liftmap lift       in.lmap in.bed [out.bed] [--from a|b]
+liftmap lift       in.lmap in.bed [out.bed] [--from a|b] [--max-gap N] [--min-match F] [--best F]
 liftmap coarsen    in.lmap out.lmap --max-gap N [--key a|b]
 liftmap dump | info | verify  in.lmap
 ```
@@ -84,6 +85,12 @@ groups sequences into genomes by the name up to the N-th separator: `.` 1 for `h
 `.` 2 for `GCA_000001635.9.chr1`, `#` 2 for PanSN `HG002#1#chr1`. Import holds `--mem`
 bytes of runs (default 1 GiB) and spills beyond that; peak memory is then the budget plus one
 sequence's runs.
+
+`lift --best F` keeps the best copy where an interval lands more than once: its pieces are
+chained (a lastz-style DP, ported from taffy, originally paffy) and a chain whose source
+overlaps better chains by more than F of its own is dropped — `--best 0` gives one target
+per base, as liftOver does. `--max-gap` merges the kept pieces into intervals and
+`--min-match` drops intervals with too little of the input aligned.
 
 `coarsen` chains runs across gaps of at most `--max-gap` bp on both axes into fewer, longer,
 approximate runs whose length is their span on the `--key` axis — a zoomed-out level of

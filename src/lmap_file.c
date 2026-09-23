@@ -1933,13 +1933,40 @@ int lmap_hit_clip(const lmap_hit *h, int axis, int64_t lo, int64_t hi, lmap_hit 
 
 /* ================================================================ LIFT */
 
-int lmap_lift(lmap_file *f, int from, uint32_t m, int64_t lo, int64_t hi, int64_t max_gap,
-              lmap_lifted **out, size_t *n) {
+int lmap_lift(lmap_file *f, int from, uint32_t m, int64_t lo, int64_t hi,
+              const lmap_lift_opts *opts, lmap_lifted **out, size_t *n) {
     if (!f || !out || !n || (from != 0 && from != 1)) return -1;
     *out = NULL; *n = 0;
+    lmap_lift_opts o = opts ? *opts : (lmap_lift_opts)LMAP_LIFT_OPTS_DEFAULT;
+    int64_t max_gap = o.max_gap;
     lmap_hit *h; size_t nh;
     if ((from ? lmap_query_b(f, m, lo, hi, &h, &nh, NULL) : lmap_query_a(f, m, lo, hi, &h, &nh, NULL)) != 0)
         return -1;
+    if (o.overlap_frac >= 0 && nh > 1) {
+        /* paralogy filter: chain the pieces on the source axis, keep the best copies */
+        lmap_span *sp = malloc(nh * sizeof *sp);
+        int64_t *cid = malloc(nh * sizeof *cid);
+        lmap_chain_info *ci = NULL; size_t nci = 0;
+        if (!sp || !cid) { free(sp); free(cid); free(h); return -1; }
+        for (size_t i = 0; i < nh; i++) {
+            sp[i].q_member = from ? h[i].b_member : h[i].a_member;
+            sp[i].t_member = from ? h[i].a_member : h[i].b_member;
+            sp[i].q_start = from ? h[i].b : h[i].a; sp[i].q_end = sp[i].q_start + h[i].len;
+            sp[i].t_start = from ? h[i].a : h[i].b; sp[i].t_end = sp[i].t_start + h[i].len;
+            sp[i].strand = h[i].strand; sp[i].score = h[i].len;
+        }
+        uint8_t *keep = NULL;
+        int rc = lmap_chain(sp, nh, &o.chain, cid, &ci, &nci);
+        if (rc == 0 && !(keep = calloc(nci + 1, 1))) rc = -1;   /* ids are 1..nci */
+        if (rc == 0) rc = lmap_chain_select(sp, nh, cid, ci, nci, o.overlap_frac, 0, keep, nci + 1);
+        if (rc == 0) {
+            size_t w = 0;
+            for (size_t i = 0; i < nh; i++) if (keep[cid[i]]) h[w++] = h[i];
+            nh = w;
+        }
+        free(sp); free(cid); free(ci); free(keep);
+        if (rc != 0) { free(h); return -1; }
+    }
     lmap_lifted *res = malloc((nh ? nh : 1) * sizeof *res);
     if (!res) { free(h); return -1; }
     /* the pieces arrive in source order; each open interval is extended by the first

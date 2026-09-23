@@ -181,6 +181,50 @@ int lmap_query_a(lmap_file *f, uint32_t m, int64_t lo, int64_t hi,
 int lmap_query_b(lmap_file *f, uint32_t m, int64_t lo, int64_t hi,
                  lmap_hit **out, size_t *n, lmap_query_stats *stats);
 
+/* ------------------------------------------------------------------ chaining and paralogy
+ *
+ * Chain aligned spans into collinear chains and keep the best copy where copies overlap
+ * -- how liftOver picks one target among paralogs, and taffy's lift/view/blockViz dupe
+ * filter.  Spans are general: the two extents may differ in length (a gapped block),
+ * so a lifted run, a MAF block or a PAF record can all be chained.
+ *
+ * lmap_chain partitions spans by (q_member, strand) and, sweeping each in q order, lets
+ * a span extend the best chain ending before it on both axes (gaps within max_gap, gap
+ * cost below the span's own score): cost = chain_open + chain_extend * (q_gap + t_gap)
+ * for a non-zero gap.  Chains are then claimed best first, and a chain is cut where a
+ * link was already claimed.  chain_id[i] (1-based) is span i's chain; *chains is sorted
+ * by score, best first.  The input is not reordered.
+ *
+ * lmap_chain_select walks the chains best first and keeps one unless its q coverage
+ * overlaps the kept chains' by more than overlap_frac of its own: a paralog (the same
+ * q bases landing again elsewhere) overlaps ~100% and drops; an inversion or a disjoint
+ * piece overlaps 0% and stays.  keep[id] is set for kept chains (keep_len > max id,
+ * zeroed by the caller); cap > 0 stops after that many. */
+
+typedef struct {
+    uint32_t q_member, t_member;
+    int64_t  q_start, q_end;      /* forward coordinates on both axes */
+    int64_t  t_start, t_end;
+    uint8_t  strand;              /* 1: q reversed relative to t */
+    int64_t  score;               /* typically the aligned length */
+} lmap_span;
+
+typedef struct {
+    int64_t chain_open, chain_extend;
+    int64_t max_gap;              /* a gap beyond this on either axis breaks a chain */
+} lmap_chain_params;
+#define LMAP_CHAIN_PARAMS_DEFAULT { 0, 1, 10000000 }
+
+typedef struct {
+    int64_t id, score, bp, n_spans;   /* bp: summed q extent */
+} lmap_chain_info;
+
+int lmap_chain(const lmap_span *spans, size_t n, const lmap_chain_params *params,
+               int64_t *chain_id, lmap_chain_info **chains, size_t *n_chains);
+int lmap_chain_select(const lmap_span *spans, size_t n, const int64_t *chain_id,
+                      const lmap_chain_info *chains, size_t n_chains, double overlap_frac,
+                      size_t cap, uint8_t *keep, size_t keep_len);
+
 /* ------------------------------------------------------------------ lift
  *
  * Lift [lo, hi) of member m on axis `from` to the other axis.  The aligned pieces are
@@ -190,7 +234,11 @@ int lmap_query_b(lmap_file *f, uint32_t m, int64_t lo, int64_t hi,
  * lmap_coarsen chains by.  max_gap < 0 merges nothing: one interval per piece.  Results
  * are in source order (of their first piece); *out is malloc'd.
  * aligned_bp counts the bases actually aligned inside an interval, so aligned_bp /
- * (hi - lo) is liftOver's -minMatch fraction. */
+ * (hi - lo) is liftOver's -minMatch fraction.
+ *
+ * With overlap_frac >= 0 the pieces are first chained (on the source axis, with
+ * `chain`) and only the chains lmap_chain_select keeps are lifted: the best copy where
+ * the source lands more than once -- liftOver's single-target behaviour at 0. */
 typedef struct {
     uint32_t member;              /* on the target axis */
     int64_t  start, end;          /* target interval */
@@ -199,8 +247,15 @@ typedef struct {
     int64_t  aligned_bp;
 } lmap_lifted;
 
-int lmap_lift(lmap_file *f, int from, uint32_t m, int64_t lo, int64_t hi, int64_t max_gap,
-              lmap_lifted **out, size_t *n);
+typedef struct {
+    int64_t max_gap;              /* merge across gaps up to this; < 0: one interval per piece */
+    double  overlap_frac;         /* paralogy filter; < 0: off, 0: strict */
+    lmap_chain_params chain;      /* for the filter's chaining */
+} lmap_lift_opts;
+#define LMAP_LIFT_OPTS_DEFAULT { -1, -1.0, LMAP_CHAIN_PARAMS_DEFAULT }
+
+int lmap_lift(lmap_file *f, int from, uint32_t m, int64_t lo, int64_t hi,
+              const lmap_lift_opts *opts, lmap_lifted **out, size_t *n);
 
 /* ------------------------------------------------------------------ writing: the builder
  *

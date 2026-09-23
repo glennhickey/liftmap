@@ -221,6 +221,41 @@ int main(int argc, char **argv) {
         if (f) lmap_close(f);
     }
 
+    printf("chaining:\n");
+    {
+        /* three collinear forward spans, one far off (beyond max_gap), one on the other
+         * strand, and a paralog of the first two (same q, elsewhere on t) */
+        lmap_span sp[6] = {
+            { 0, 0,   0, 100, 1000, 1100, 0, 100 },   /* gaps of 20 + 20: cost 40 < 100 */
+            { 0, 0, 120, 220, 1120, 1220, 0, 100 },
+            { 0, 0, 240, 340, 1240, 1340, 0, 100 },
+            { 0, 0, 900000, 900100, 1400, 1500, 0, 100 },
+            { 0, 0, 500, 600, 5000, 5100, 1, 100 },
+            { 0, 0,  20, 180, 8000, 8160, 0, 160 },
+        };
+        lmap_chain_params cp = { 0, 1, 10000 };
+        int64_t cid[6]; lmap_chain_info *ci; size_t nci;
+        CHECK("chains", lmap_chain(sp, 6, &cp, cid, &ci, &nci) == 0);
+        CHECK("the collinear three form one chain", cid[0] == cid[1] && cid[1] == cid[2]);
+        CHECK("a span past max_gap, the other strand and the paralog stand apart",
+              cid[3] != cid[0] && cid[4] != cid[0] && cid[5] != cid[0] && cid[3] != cid[4]);
+        CHECK("best chain first, scored 300 - gaps (20+20 + 20+20)", nci == 4 && ci[0].id == cid[0] && ci[0].score == 300 - 80 &&
+              ci[0].n_spans == 3 && ci[0].bp == 300);
+        uint8_t keep[8] = {0};
+        CHECK("select", lmap_chain_select(sp, 6, cid, ci, nci, 0.0, 0, keep, sizeof keep) == 0);
+        CHECK("strict: the paralog (q 20-180 inside the kept chain) drops, the rest stay",
+              keep[cid[0]] && !keep[cid[5]] && keep[cid[3]] && keep[cid[4]]);
+        memset(keep, 0, sizeof keep);
+        lmap_chain_select(sp, 6, cid, ci, nci, 1.0, 0, keep, sizeof keep);
+        CHECK("overlap_frac 1 keeps everything", keep[cid[0]] && keep[cid[5]] && keep[cid[3]] && keep[cid[4]]);
+        int64_t cid2[6]; lmap_chain_info *ci2; size_t nci2;
+        lmap_span rev[6]; for (int i = 0; i < 6; i++) rev[i] = sp[5 - i];
+        lmap_chain(rev, 6, &cp, cid2, &ci2, &nci2);
+        int same = 1; for (int i = 0; i < 6; i++) same &= cid2[5 - i] == cid[i];
+        CHECK("chain ids do not depend on input order", same);
+        free(ci); free(ci2);
+    }
+
     /* metadata and groups */
     printf("metadata and groups:\n");
     w = lmap_writer_open(path, "test");

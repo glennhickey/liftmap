@@ -237,6 +237,40 @@ def lift_merge_check(label, lmap, pairs, seqs, side, rnd, gap, n=300):
             want.append((f'w{i}', r['tq'], str(r['ts']), str(r['te']), '-' if r['st'] else '+'))
     check(f'{label}: {len(want)} intervals merged at --max-gap {gap} match the oracle', got == sorted(want))
 
+def best_check(lmap, seqs, side, rnd, n=3000):
+    """--best (the paralogy filter) on data with paralogs: single bases lift to at most
+    one target, a subset of the unfiltered result, non-empty whenever that is; --best 1
+    keeps everything; windows under --best 0 lift to a subset of the unfiltered pieces."""
+    def rows(bed, *opt):
+        return [tuple(l.split('\t')[i] for i in (3, 0, 1, 2, 5))
+                for l in run('lift', lmap, bed, '--from', side, *opt).stdout.splitlines()]
+    def bed_of(pts, name):
+        f = tempfile.NamedTemporaryFile('w', suffix='.bed', delete=False)
+        for i, (sq, lo, hi) in enumerate(pts):
+            f.write(f'{sq}\t{lo}\t{hi}\t{name}{i}\t0\t+\n')
+        f.close(); return f.name
+    names = list(seqs)
+    pts = []
+    for _ in range(n):
+        sq = rnd.choice(names); p = rnd.randrange(seqs[sq]); pts.append((sq, p, p + 1))
+    bed = bed_of(pts, 'p')
+    allr, strict, loose = rows(bed), rows(bed, '--best', 0), rows(bed, '--best', 1)
+    per_all, per_strict = {}, {}
+    for r in allr: per_all.setdefault(r[0], []).append(r)
+    for r in strict: per_strict.setdefault(r[0], []).append(r)
+    multi = sum(1 for v in per_all.values() if len(v) > 1)
+    check(f'--best 0: {multi} bases with several targets each keep exactly one',
+          all(len(per_strict.get(k, [])) == 1 for k in per_all) and set(strict) <= set(allr))
+    check('--best 1 keeps every target', sorted(loose) == sorted(allr))
+    os.unlink(bed)
+    wins = []
+    for _ in range(300):
+        sq = rnd.choice(names); lo = rnd.randrange(max(1, seqs[sq] - 500)); wins.append((sq, lo, min(seqs[sq], lo + 500)))
+    bed = bed_of(wins, 'w')
+    wa, ws = rows(bed), rows(bed, '--best', 0)
+    check(f'--best 0 on windows keeps a subset of the pieces ({len(ws)} of {len(wa)})', set(ws) <= set(wa) and len(ws) < len(wa))
+    os.unlink(bed)
+
 def dump(lmap):
     out = run('dump', lmap).stdout
     return sorted((f[0], int(f[1]), f[2], int(f[3]), int(f[4]), f[5])
@@ -337,6 +371,7 @@ def main():
         check(f'to-{fmt} re-imports to the same runs', dump(y) == want)
     lift_check('a->b', O, pairs, qseqs, 'a', rnd)
     lift_check('b->a', O, pairs, tseqs, 'b', rnd)
+    best_check(O, tseqs, 'b', rnd)
 
     print('spilling (the builder over its memory budget):')
     recs = gen_records(rnd, qseqs, tseqs, 400, disjoint_q=False)
