@@ -33,6 +33,11 @@ struct lmap_builder {
     int allow_overlap;
     uint64_t *len[2]; uint32_t n_mem[2], cap_mem[2];   /* member lengths, for checks */
     brec *buf; size_t n, cap;
+    /* pre-sorted mode: runs stream to the writer, merged with their predecessor */
+    int presorted, started;
+    brec pend; int have_pend;
+    uint8_t *done_a;                     /* a-members already passed, to catch a revisit */
+    uint32_t cur_a; int have_cur_a; int64_t cur_a_end;
     FILE *spill; uint64_t *seg_off, *seg_n; uint32_t n_seg, cap_seg;
     lmap_build_stats st;
     char err[512];
@@ -67,7 +72,37 @@ lmap_builder *lmap_builder_open(const char *path, const char *profile,
     return b;
 }
 
-lmap_writer *lmap_builder_writer(lmap_builder *b) { return b ? b->w : NULL; }
+/* ---- pass-throughs: everything but members, runs and the order ---- */
+
+int lmap_builder_set_meta(lmap_builder *b, const char *key, const char *value) {
+    if (!b || b->failed) return -1;
+    return lmap_writer_set_meta(b->w, key, value) ? fail(b, "cannot set metadata %s", key ? key : "") : 0;
+}
+int32_t lmap_builder_add_group(lmap_builder *b, int axis, const char *name) {
+    if (!b || b->failed) return -1;
+    int32_t g = lmap_writer_add_group(b->w, axis, name);
+    if (g < 0) return fail(b, "cannot add group %s (duplicate name?)", name ? name : "");
+    return g;
+}
+int lmap_builder_set_member_group(lmap_builder *b, int axis, uint32_t member, uint32_t group) {
+    if (!b || b->failed) return -1;
+    return lmap_writer_set_member_group(b->w, axis, member, group)
+         ? fail(b, "cannot put member %u in group %u", member, group) : 0;
+}
+int lmap_builder_add_section(lmap_builder *b, const char *id, const void *data, size_t n) {
+    if (!b || b->failed) return -1;
+    return lmap_writer_add_section(b->w, id, data, n)
+         ? fail(b, "cannot add section %s (ids start x. and are unique)", id ? id : "") : 0;
+}
+int lmap_builder_set_params(lmap_builder *b, uint32_t count, uint64_t bspan, int codec) {
+    if (!b || b->failed) return -1;
+    return lmap_writer_set_params(b->w, count, bspan, codec) ? fail(b, "bad chunk parameters") : 0;
+}
+
+int lmap_builder_set_presorted(lmap_builder *b, int on) {
+    if (!b || b->failed || b->n || b->n_seg || b->started) return -1;
+    b->presorted = on != 0; return 0;
+}
 
 int32_t lmap_builder_add_member(lmap_builder *b, int axis, const char *name, uint64_t length) {
     if (!b || b->failed || (axis != 0 && axis != 1)) return -1;
@@ -154,6 +189,9 @@ static int spill(lmap_builder *b) {
     return 0;
 }
 
+static int choose_order(lmap_builder *b);
+static int presorted_run(lmap_builder *b, const brec *r);
+
 int lmap_builder_add_run(lmap_builder *b, uint32_t a_member, uint32_t b_member,
                          int64_t a, int64_t bpos, int64_t len, uint8_t strand) {
     if (!b || b->failed) return -1;
@@ -164,6 +202,11 @@ int lmap_builder_add_run(lmap_builder *b, uint32_t a_member, uint32_t b_member,
         return fail(b, "run a=%lld b=%lld len=%lld lies outside its members (lengths %llu, %llu)",
                     (long long)a, (long long)bpos, (long long)len,
                     (unsigned long long)b->len[0][a_member], (unsigned long long)b->len[1][b_member]);
+    if (b->presorted) {
+        brec r = { a_member, b_member, a, bpos, len, (uint8_t)(strand ? 1 : 0) };
+        b->st.input_runs++;
+        return presorted_run(b, &r);
+    }
     if (b->n == b->cap) {
         size_t cap = b->cap ? b->cap * 2 : 4096;
         size_t lim = b->budget / sizeof *b->buf;
@@ -179,6 +222,71 @@ int lmap_builder_add_run(lmap_builder *b, uint32_t a_member, uint32_t b_member,
     brec *r = &b->buf[b->n++];
     r->am = a_member; r->bm = b_member; r->a = a; r->b = bpos; r->len = len; r->strand = strand ? 1 : 0;
     b->st.input_runs++;
+    return 0;
+}
+
+/* ---- pre-sorted mode ----
+ *
+ * The caller promises what the sort would produce: each axis-a member's runs together,
+ * in increasing a.  Nothing is buffered; a run that continues the previous one on its
+ * diagonal is merged into it, and everything else goes straight to the writer.  The
+ * order is fixed at the first run -- order b with A_OVERLAP declared when overlap is
+ * allowed, since it cannot be known in advance -- and a broken promise fails the build
+ * rather than writing something else. */
+
+static int presorted_flush(lmap_builder *b) {
+    if (!b->have_pend) return 0;
+    b->have_pend = 0;
+    brec *p = &b->pend;
+    if (lmap_writer_add_run(b->w, p->am, p->bm, p->a, p->b, p->len, p->strand))
+        return fail(b, "writer refused run a_member %u a=%lld len=%lld", p->am, (long long)p->a,
+                    (long long)p->len);
+    b->st.runs++;
+    return 0;
+}
+
+static int presorted_start(lmap_builder *b) {
+    if (b->started) return 0;
+    b->started = 1;
+    {
+        if (b->allow_overlap) {
+            if (lmap_writer_set_order(b->w, LMAP_ORDER_B) || lmap_writer_set_a_overlap(b->w))
+                return fail(b, "cannot set the storage order");
+            b->st.order = LMAP_ORDER_B;
+        } else {
+            int order = b->order < 0 ? LMAP_ORDER_A : b->order;
+            if (lmap_writer_set_order(b->w, order)) return fail(b, "cannot set the storage order");
+            b->st.order = order;
+        }
+        if (!(b->done_a = calloc(b->n_mem[0] ? b->n_mem[0] : 1, 1))) return fail(b, "out of memory");
+    }
+    return 0;
+}
+
+static int presorted_run(lmap_builder *b, const brec *r) {
+    if (presorted_start(b)) return -1;
+    if (!b->have_cur_a || r->am != b->cur_a) {
+        if (r->am >= b->n_mem[0] || b->done_a[r->am])
+            return fail(b, "pre-sorted runs of axis-a member %u are not contiguous", r->am);
+        if (b->have_cur_a) b->done_a[b->cur_a] = 1;
+        b->cur_a = r->am; b->have_cur_a = 1; b->cur_a_end = 0;
+    } else if (r->a < b->cur_a_end) {
+        if (!b->allow_overlap)
+            return fail(b, "pre-sorted runs of axis-a member %u overlap or go backwards at a=%lld",
+                        r->am, (long long)r->a);
+        b->st.overlapping_runs++;
+    }
+    if (r->a + r->len > b->cur_a_end) b->cur_a_end = r->a + r->len;
+    brec *p = &b->pend;
+    if (b->have_pend && p->am == r->am && p->bm == r->bm && p->strand == r->strand &&
+        p->a + p->len == r->a && diag(p) == diag(r)) {
+        int64_t d = diag(p);
+        p->len += r->len;
+        p->b = p->strand ? d - p->a - p->len : d + p->a;
+        return 0;
+    }
+    if (presorted_flush(b)) return -1;
+    b->pend = *r; b->have_pend = 1;
     return 0;
 }
 
@@ -361,7 +469,10 @@ static int choose_order(lmap_builder *b) {
 int lmap_builder_close(lmap_builder *b, lmap_build_stats *stats) {
     if (!b) return -1;
     int rc = b->failed ? -1 : 0;
-    if (rc == 0 && b->n_seg == 0) {
+    if (b->presorted) {
+        if (rc == 0) rc = presorted_start(b);        /* no runs at all: still fix the order */
+        if (rc == 0) rc = presorted_flush(b);
+    } else if (rc == 0 && b->n_seg == 0) {
         /* everything in memory: canonicalize, sort each member, decide, write */
         merger m;
         size_t n = 0;
@@ -535,7 +646,7 @@ void lmap_builder_abort(lmap_builder *b) {
     if (b->w) lmap_writer_abort(b->w);
     if (b->spill) fclose(b->spill);
     free(b->len[0]); free(b->len[1]);
-    free(b->buf); free(b->seg_off); free(b->seg_n);
+    free(b->buf); free(b->seg_off); free(b->seg_n); free(b->done_a);
     free(b->path); free(b->tmp_dir);
     free(b);
 }

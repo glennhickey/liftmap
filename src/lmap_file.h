@@ -197,7 +197,7 @@ int lmap_query_b(lmap_file *f, uint32_t m, int64_t lo, int64_t hi,
 
 /* ------------------------------------------------------------------ builder
  *
- * A front end to the writer for runs that arrive in any order.  Runs may repeat, overlap,
+ * The way to write a liftmap file.  Runs arrive in any order.  Runs may repeat, overlap,
  * or split one colinear stretch into pieces: at close they are reduced to the canonical
  * form of the aligned base-pair set -- maximal runs, unioned along each diagonal -- so the
  * same base pairs always give the same file.  Each axis-a member's runs are then sorted
@@ -210,9 +210,16 @@ int lmap_query_b(lmap_file *f, uint32_t m, int64_t lo, int64_t hi,
  * creation, so nothing is left behind even on a crash.  Close holds one axis-a member's
  * runs at a time.
  *
- * Members are declared through the builder (it checks runs against their lengths).
- * Metadata, groups, sections and chunk parameters go straight to the underlying writer,
- * lmap_builder_writer(b); do not add members, runs, or set the order on it directly. */
+ * Pre-sorted mode (lmap_builder_set_presorted, before the first run) is for callers
+ * whose runs already arrive as the sort would leave them -- each axis-a member's runs
+ * together, in increasing a.  Nothing is buffered or spilled: runs are merged with a
+ * predecessor they continue and streamed to the file, so the cost is the caller's own
+ * sort.  The order is fixed at the first run (order b with A_OVERLAP if overlap is
+ * allowed, since overlap cannot be known in advance), and a run that breaks the promise
+ * fails the build.
+ *
+ * Every call returns -1 on failure, fails the builder, and leaves the reason in
+ * lmap_builder_error. */
 
 #define LMAP_ORDER_AUTO (-1)
 
@@ -229,8 +236,13 @@ typedef struct {
 
 lmap_builder *lmap_builder_open(const char *path, const char *profile,
                                 size_t mem_bytes, const char *tmp_dir);
-lmap_writer  *lmap_builder_writer(lmap_builder *b);
 int32_t lmap_builder_add_member(lmap_builder *b, int axis, const char *name, uint64_t length);
+int     lmap_builder_set_meta(lmap_builder *b, const char *key, const char *value);
+int32_t lmap_builder_add_group(lmap_builder *b, int axis, const char *name);
+int     lmap_builder_set_member_group(lmap_builder *b, int axis, uint32_t member, uint32_t group);
+int     lmap_builder_add_section(lmap_builder *b, const char *id, const void *data, size_t n);
+int     lmap_builder_set_params(lmap_builder *b, uint32_t count, uint64_t bspan, int codec);
+int     lmap_builder_set_presorted(lmap_builder *b, int on);
 int     lmap_builder_add_run(lmap_builder *b, uint32_t a_member, uint32_t b_member,
                              int64_t a, int64_t bpos, int64_t len, uint8_t strand);
 int     lmap_builder_set_order(lmap_builder *b, int order);   /* LMAP_ORDER_A/B/AUTO */

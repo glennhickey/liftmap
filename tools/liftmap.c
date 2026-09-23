@@ -280,7 +280,7 @@ static const char *nth_sep(const char *name, char sep, int n) {
     return (p == name || !p[1]) ? NULL : p;
 }
 
-static void add_groups(lmap_writer *w, importer *im, char sep, int fields) {
+static void add_groups(lmap_builder *w, importer *im, char sep, int fields) {
     for (int ax = 0; ax < 2; ax++) {
         seqtab g = {0};
         for (uint32_t i = 0; i < im->ax[ax].n; i++) {
@@ -290,8 +290,8 @@ static void add_groups(lmap_writer *w, importer *im, char sep, int fields) {
             memcpy(prefix, name, (size_t)(cut - name)); prefix[cut - name] = 0;
             uint32_t n0 = g.n;
             uint32_t gid = seqtab_id(&g, prefix, 0, NULL);
-            if (g.n > n0 && lmap_writer_add_group(w, ax, prefix) != (int32_t)gid) die("cannot add group %s", prefix);
-            if (lmap_writer_set_member_group(w, ax, i, gid)) die("cannot group %s", name);
+            if (g.n > n0 && lmap_builder_add_group(w, ax, prefix) != (int32_t)gid) die("%s", lmap_builder_error(w));
+            if (lmap_builder_set_member_group(w, ax, i, gid)) die("%s", lmap_builder_error(w));
             free(prefix);
         }
         for (uint32_t i = 0; i < g.n; i++) free(g.seq[i].name);
@@ -301,13 +301,13 @@ static void add_groups(lmap_writer *w, importer *im, char sep, int fields) {
 
 static void finish_import(importer *im, const char *out, const char *profile,
                           const char *source, char group_sep, int group_fields) {
-    lmap_writer *w = lmap_builder_writer(im->b);
+    lmap_builder *w = im->b;
     if (group_sep) add_groups(w, im, group_sep, group_fields);
     int paf = !strcmp(profile, "paf");
-    if (lmap_writer_set_meta(w, "source", source) ||
-        lmap_writer_set_meta(w, "axis.a", paf ? (im->swap ? "target" : "query") : (im->swap ? "q" : "t")) ||
-        lmap_writer_set_meta(w, "axis.b", paf ? (im->swap ? "query" : "target") : (im->swap ? "t" : "q")))
-        die("cannot set metadata");
+    if (lmap_builder_set_meta(w, "source", source) ||
+        lmap_builder_set_meta(w, "axis.a", paf ? (im->swap ? "target" : "query") : (im->swap ? "q" : "t")) ||
+        lmap_builder_set_meta(w, "axis.b", paf ? (im->swap ? "query" : "target") : (im->swap ? "t" : "q")))
+        die("%s", lmap_builder_error(w));
     lmap_build_stats st;
     if (lmap_builder_close(im->b, &st))
         die("%s%s", st.error, st.overlapping_runs ? " (--allow-overlap to accept it, stored in order b; "

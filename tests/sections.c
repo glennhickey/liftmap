@@ -172,6 +172,55 @@ int main(int argc, char **argv) {
         if (f) lmap_close(f);
     }
 
+    printf("builder, pre-sorted:\n");
+    {
+        lmap_build_stats bs;
+        lmap_builder *bd = lmap_builder_open(path, "test", 0, NULL);
+        lmap_builder_add_member(bd, 0, "s", 100); lmap_builder_add_member(bd, 0, "u", 100);
+        lmap_builder_add_member(bd, 1, "t", 1000);
+        CHECK("switches to pre-sorted before the first run", lmap_builder_set_presorted(bd, 1) == 0);
+        lmap_builder_add_run(bd, 0, 0, 0, 100, 10, 0);
+        lmap_builder_add_run(bd, 0, 0, 10, 110, 5, 0);   /* continues: merged */
+        lmap_builder_add_run(bd, 0, 0, 20, 500, 5, 1);
+        lmap_builder_add_run(bd, 1, 0, 0, 0, 5, 0);
+        CHECK("closes; the continuation is merged", lmap_builder_close(bd, &bs) == 0 &&
+              bs.input_runs == 4 && bs.runs == 3 && bs.order == LMAP_ORDER_A);
+        f = lmap_open(path);
+        lmap_hit *hh; size_t hn;
+        CHECK("reads back", f && lmap_query_a(f, 0, 0, 100, &hh, &hn, NULL) == 0 && hn == 2 &&
+              hh[0].len == 15 && hh[1].strand == 1);
+        free(hh); if (f) lmap_close(f);
+
+        bd = lmap_builder_open(path, "test", 0, NULL);
+        lmap_builder_add_member(bd, 0, "s", 100); lmap_builder_add_member(bd, 0, "u", 100);
+        lmap_builder_add_member(bd, 1, "t", 1000);
+        lmap_builder_set_presorted(bd, 1);
+        lmap_builder_add_run(bd, 0, 0, 0, 100, 10, 0);
+        lmap_builder_add_run(bd, 1, 0, 0, 0, 5, 0);
+        CHECK("refuses a member revisited", lmap_builder_add_run(bd, 0, 0, 50, 300, 5, 0) != 0 &&
+              strstr(lmap_builder_error(bd), "contiguous"));
+        lmap_builder_abort(bd);
+
+        bd = lmap_builder_open(path, "test", 0, NULL);
+        lmap_builder_add_member(bd, 0, "s", 100); lmap_builder_add_member(bd, 1, "t", 1000);
+        lmap_builder_set_presorted(bd, 1);
+        lmap_builder_add_run(bd, 0, 0, 20, 100, 10, 0);
+        CHECK("refuses a run going backwards", lmap_builder_add_run(bd, 0, 0, 5, 300, 5, 0) != 0 &&
+              strstr(lmap_builder_error(bd), "backwards"));
+        lmap_builder_abort(bd);
+
+        bd = lmap_builder_open(path, "test", 0, NULL);
+        lmap_builder_add_member(bd, 0, "s", 100); lmap_builder_add_member(bd, 1, "t", 1000);
+        lmap_builder_set_presorted(bd, 1);
+        lmap_builder_allow_overlap(bd, 1);
+        lmap_builder_add_run(bd, 0, 0, 20, 100, 10, 0);
+        lmap_builder_add_run(bd, 0, 0, 25, 300, 10, 0);
+        CHECK("overlap allowed: order b, flag set, overlap counted",
+              lmap_builder_close(bd, &bs) == 0 && bs.order == LMAP_ORDER_B && bs.overlapping_runs == 1 &&
+              (f = lmap_open(path)) != NULL && lmap_a_overlap(f) == 1);
+        if (f) lmap_close(f);
+    }
+
     /* metadata and groups */
     printf("metadata and groups:\n");
     w = lmap_writer_open(path, "test");
