@@ -80,23 +80,22 @@ static int32_t t_remove(treap *T, int32_t n, int32_t x) {
     else T->t[n].r = t_remove(T, T->t[n].r, x);
     return n;
 }
-/* largest node with (tm, te) <= (tm, ts): every predecessor candidate is at or before it */
-static int32_t t_find_le(const treap *T, uint32_t tm, int64_t ts) {
-    int32_t n = T->root, best = -1;
+/* Walk the nodes with (tm, te) <= (tm, ts) in descending key order: every predecessor
+ * candidate, nearest first.  A stack of the unvisited nodes at or below the bound makes
+ * each step O(1) amortised (the tree is not modified during a walk). */
+typedef struct { int32_t *st; int32_t n; } rwalk;
+static void rwalk_push_le(const treap *T, rwalk *w, int32_t n, uint32_t tm, int64_t ts) {
     while (n >= 0) {
         const cspan *a = &T->s[n];
-        if (a->tm < tm || (a->tm == tm && a->te <= ts)) { best = n; n = T->t[n].r; }
+        if (a->tm < tm || (a->tm == tm && a->te <= ts)) { w->st[w->n++] = n; n = T->t[n].r; }
         else n = T->t[n].l;
     }
-    return best;
 }
-static int32_t t_find_lt(const treap *T, int32_t x) {                  /* in-order predecessor */
-    int32_t n = T->root, best = -1;
-    while (n >= 0) {
-        if (key_cmp(T, n, x) < 0) { best = n; n = T->t[n].r; }
-        else n = T->t[n].l;
-    }
-    return best;
+static int32_t rwalk_next(const treap *T, rwalk *w) {
+    if (w->n == 0) return -1;
+    int32_t x = w->st[--w->n];
+    for (int32_t m = T->t[x].l; m >= 0; m = T->t[m].r) w->st[w->n++] = m;   /* its left subtree */
+    return x;
 }
 
 typedef struct { int64_t score; int32_t prev; } dnode;
@@ -148,10 +147,10 @@ int lmap_chain(const lmap_span *in, size_t n, const lmap_chain_params *params,
     dnode *d = malloc(n * sizeof *d);
     uint8_t *taken = calloc(n, 1);
     int32_t *ord = malloc(n * sizeof *ord), *tmp = malloc(n * sizeof *tmp);
-    int32_t *drop = malloc(n * sizeof *drop);
+    int32_t *drop = malloc(n * sizeof *drop), *walk = malloc(n * sizeof *walk);
     lmap_chain_info *info = malloc(n * sizeof *info);
-    if (!s || !tn || !d || !taken || !ord || !tmp || !drop || !info) {
-        free(s); free(tn); free(d); free(taken); free(ord); free(tmp); free(drop); free(info);
+    if (!s || !tn || !d || !taken || !ord || !tmp || !drop || !walk || !info) {
+        free(s); free(tn); free(d); free(taken); free(ord); free(tmp); free(drop); free(walk); free(info);
         return -1;
     }
     for (size_t i = 0; i < n; i++) {
@@ -165,9 +164,11 @@ int lmap_chain(const lmap_span *in, size_t n, const lmap_chain_params *params,
         c->score = x->score; c->idx = i;
     }
     qsort(s, n, sizeof *s, cmp_sweep);
-    for (size_t i = 0; i < n; i++) {                   /* deterministic treap priorities */
-        uint64_t h = (uint64_t)(i + 1) * 0x9E3779B97F4A7C15ull;
-        tn[i].pri = (uint32_t)(h >> 32);
+    for (size_t i = 0; i < n; i++) {                   /* deterministic treap priorities: */
+        uint64_t z = (uint64_t)i + 0x9E3779B97F4A7C15ull;  /* splitmix64, so they behave as */
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;       /* random -- a plain multiplicative */
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;       /* hash of 0,1,2.. is correlated */
+        tn[i].pri = (uint32_t)((z ^ (z >> 31)) >> 32);     /* and left the tree deep */
     }
     int64_t next_id = 1;
     size_t ni = 0;
@@ -179,7 +180,9 @@ int lmap_chain(const lmap_span *in, size_t n, const lmap_chain_params *params,
             const cspan *a = &s[i];
             d[i].score = a->score; d[i].prev = -1;
             size_t nd = 0;
-            for (int32_t pc = t_find_le(&T, a->tm, a->ts); pc >= 0; pc = t_find_lt(&T, pc)) {
+            rwalk rw = { walk, 0 };
+            rwalk_push_le(&T, &rw, T.root, a->tm, a->ts);
+            for (int32_t pc = rwalk_next(&T, &rw); pc >= 0; pc = rwalk_next(&T, &rw)) {
                 const cspan *b = &s[pc];
                 if (b->tm != a->tm) break;              /* the key leads with tm */
                 if (a->qs < b->qe) continue;            /* q overlap: skip, keep scanning */
@@ -223,7 +226,7 @@ int lmap_chain(const lmap_span *in, size_t n, const lmap_chain_params *params,
         lo = hi;
     }
     qsort(info, ni, sizeof *info, cmp_info);
-    free(s); free(tn); free(d); free(taken); free(ord); free(tmp); free(drop);
+    free(s); free(tn); free(d); free(taken); free(ord); free(tmp); free(drop); free(walk);
     *chains = info; *n_chains = ni;
     return 0;
 }
