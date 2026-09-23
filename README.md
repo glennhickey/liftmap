@@ -121,4 +121,4 @@ make HTTP=1     # also read http(s):// URLs (needs libcurl; `make clean` when sw
 
 ## Licence
 
-TBD.
+MIT; see `LICENSE`.
