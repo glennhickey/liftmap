@@ -76,7 +76,7 @@ int main(int argc, char **argv) {
     for (long i=0;i<n;i++){ if(r[i].am+1>na) na=r[i].am+1; if(r[i].bm+1>nb) nb=r[i].bm+1; }
     for (long i=0;i<n;i++) r[i].am = na-1-r[i].am;          /* remap: ids no longer in input order */
 
-    lmap_writer *w = lmap_writer_open(argv[2],"hal2.edge","liftmap 1\n");
+    lmap_writer *w = lmap_writer_open(argv[2], "hal2.edge");
     if (lmap_writer_set_order(w, order) != 0) { fprintf(stderr,"set_order failed\n"); return 1; }
     char nm[64];
     for (int32_t i=0;i<na;i++){ snprintf(nm,sizeof nm,"a%d",i); lmap_writer_add_member(w,0,nm,1ULL<<40); }

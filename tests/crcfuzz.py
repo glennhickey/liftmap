@@ -5,7 +5,7 @@ Without the CRC repair this finds nothing: the integrity checks reject ~100% of 
 mutations before the parsers ever run. With it, ~45% of mutants open and exercise the
 directory and chunk decode paths.
 
-usage: crcfuzz.py file.lmap iters [seed] [all|tail]
+usage: crcfuzz.py file.lmap iters [seed] [all|tail|sec:ID]
 expects ./pocrun: tests/fuzz_reader.c built with -fsanitize=address,undefined.
 """
 import struct, zlib, random, subprocess, sys, os
@@ -49,7 +49,12 @@ iters=int(sys.argv[2]); seed=int(sys.argv[3]) if len(sys.argv)>3 else 1
 region=sys.argv[4] if len(sys.argv)>4 else 'all'
 rnd=random.Random(seed)
 foff,flen,secs=parse(src)
-lo,hi = (0,len(src)) if region=='all' else (foff-1500000, len(src))
+if region.startswith('sec:'):                 # one section by id, e.g. sec:meta
+    so_sl=[(so,sl) for sid,so,sl,c in secs if sid==region[4:]]
+    if not so_sl: sys.exit(f'no section {region[4:]}')
+    lo,hi = so_sl[0][0], so_sl[0][0]+so_sl[0][1]
+else:
+    lo,hi = (0,len(src)) if region=='all' else (foff-1500000, len(src))
 lo=max(lo,0)
 opened=0; crashes=0
 for it in range(iters):

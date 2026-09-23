@@ -96,12 +96,13 @@ static int raw_inflate(const uint8_t *in, size_t n, uint8_t *out, size_t want) {
 
 typedef struct {
     char *name; uint64_t length, amin, amax; uint32_t first_chunk, n_chunks; int seen;
+    uint32_t group;                          /* LMAP_NO_GROUP unless assigned */
     int64_t last_a_exit; int has_runs;       /* axis-a order is per member, across chunks */
 } wmember;
 
 struct lmap_writer {
     FILE    *fp;
-    char    *path, *profile, *schema;
+    char    *path, *tmp, *profile;    /* written to tmp, renamed to path on close */
     uint32_t count;  uint64_t bspan;  int codec;  int order;  int a_overlap;
 
     wmember *mem[2];  uint32_t n_mem[2], cap_mem[2];
@@ -112,6 +113,11 @@ struct lmap_writer {
 
     lmap_chunk *chunks; uint32_t n_chunks, cap_chunks;
 
+    /* metadata (SPEC 2.5): key -> value, keys unique */
+    struct kv { char *k, *v; } *meta;  uint32_t n_meta, cap_meta;
+    /* groups (SPEC 2.4a), per axis */
+    char **grp[2];  uint32_t n_grp[2], cap_grp[2];
+
     /* application sections (SPEC 2.5): stored and checksummed, never interpreted */
     struct xsec { char *id; uint8_t *p; size_t n; } *xs;  uint32_t n_xs, cap_xs;
 
@@ -121,16 +127,21 @@ struct lmap_writer {
     int failed;
 };
 
-lmap_writer *lmap_writer_open(const char *path, const char *profile, const char *schema) {
+lmap_writer *lmap_writer_open(const char *path, const char *profile) {
     lmap_writer *w = calloc(1, sizeof *w);
     if (!w) return NULL;
-    w->fp = fopen(path, "wb");
-    if (!w->fp) { free(w); return NULL; }
+    /* Written under a temporary name and renamed into place by a successful close, so
+     * a crash or failure never leaves a truncated file at `path`. */
+    size_t pl = strlen(path);
+    w->tmp = malloc(pl + sizeof ".partial");
+    if (!w->tmp) { free(w); return NULL; }
+    memcpy(w->tmp, path, pl); memcpy(w->tmp + pl, ".partial", sizeof ".partial");
+    w->fp = fopen(w->tmp, "wb");
+    if (!w->fp) { free(w->tmp); free(w); return NULL; }
     w->path = strdup(path);
     w->profile = strdup(profile ? profile : "");
-    w->schema = strdup(schema ? schema : "");
     w->count = 8192; w->bspan = 1000000; w->codec = LMAP_CODEC_DEFLATE; w->order = LMAP_ORDER_A;
-    if (!w->path || !w->profile || !w->schema) { lmap_writer_abort(w); return NULL; }
+    if (!w->path || !w->profile) { lmap_writer_abort(w); return NULL; }
     return w;
 }
 
@@ -179,6 +190,48 @@ int lmap_writer_add_section(lmap_writer *w, const char *id, const void *data, si
     return 0;
 }
 
+int lmap_writer_set_meta(lmap_writer *w, const char *key, const char *value) {
+    if (!w || w->failed || !key || !value || !*key || strlen(key) > 255) return -1;
+    for (uint32_t i = 0; i < w->n_meta; i++)
+        if (!strcmp(w->meta[i].k, key)) {
+            char *v = strdup(value);
+            if (!v) return -1;
+            free(w->meta[i].v); w->meta[i].v = v;
+            return 0;
+        }
+    if (w->n_meta == w->cap_meta) {
+        uint32_t cap = w->cap_meta ? w->cap_meta * 2 : 8;
+        struct kv *nm = realloc(w->meta, cap * sizeof *nm);
+        if (!nm) return -1;
+        w->meta = nm; w->cap_meta = cap;
+    }
+    char *k = strdup(key), *v = strdup(value);
+    if (!k || !v) { free(k); free(v); return -1; }
+    w->meta[w->n_meta].k = k; w->meta[w->n_meta].v = v; w->n_meta++;
+    return 0;
+}
+
+int32_t lmap_writer_add_group(lmap_writer *w, int axis, const char *name) {
+    if (!w || w->failed || (axis != 0 && axis != 1) || !name || !*name) return -1;
+    for (uint32_t i = 0; i < w->n_grp[axis]; i++) if (!strcmp(w->grp[axis][i], name)) return -1;
+    if (w->n_grp[axis] >= (uint32_t)INT32_MAX) return -1;
+    if (w->n_grp[axis] == w->cap_grp[axis]) {
+        uint32_t cap = w->cap_grp[axis] ? w->cap_grp[axis] * 2 : 16;
+        char **ng = realloc(w->grp[axis], cap * sizeof *ng);
+        if (!ng) return -1;
+        w->grp[axis] = ng; w->cap_grp[axis] = cap;
+    }
+    if (!(w->grp[axis][w->n_grp[axis]] = strdup(name))) return -1;
+    return (int32_t)w->n_grp[axis]++;
+}
+
+int lmap_writer_set_member_group(lmap_writer *w, int axis, uint32_t member, uint32_t group) {
+    if (!w || w->failed || (axis != 0 && axis != 1) || member >= w->n_mem[axis] ||
+        group >= w->n_grp[axis]) return -1;
+    w->mem[axis][member].group = group;
+    return 0;
+}
+
 int32_t lmap_writer_add_member(lmap_writer *w, int axis, const char *name, uint64_t length) {
     if (!w || (axis != 0 && axis != 1) || !name) return -1;
     if (w->n_mem[axis] == w->cap_mem[axis]) {
@@ -192,6 +245,7 @@ int32_t lmap_writer_add_member(lmap_writer *w, int axis, const char *name, uint6
     m->name = strdup(name);
     if (!m->name) return -1;
     m->length = length;
+    m->group = LMAP_NO_GROUP;
     return (int32_t)w->n_mem[axis]++;
 }
 
@@ -425,6 +479,10 @@ static int build_memdir(lmap_writer *w, int axis, vec *out) {
         perm[i].name = w->mem[axis][i].name; perm[i].id = i;
     }
     qsort(perm, n, sizeof *perm, cmp_by_name);
+    /* names must be unique per axis: lookups are by name, and the reader refuses a
+     * directory whose names do not strictly increase */
+    for (uint32_t i = 1; i < n; i++)
+        if (!strcmp(perm[i-1].name, perm[i].name)) { free(noff); free(nlen); free(perm); return -1; }
 
     if (vec_put32(out, n) != 0) goto fail;
     if (vec_put32(out, (uint32_t)names.n) != 0) goto fail;
@@ -477,6 +535,7 @@ int lmap_writer_close(lmap_writer *w) {
     if (!w) return -1;
     int rc = -1;
     vec foot = {0}, dira = {0}, dirax = {0}, dirb = {0}, ma = {0}, mb = {0};
+    vec meta = {0}, grp[2] = {{0}};
     if (w->failed) goto done;
     if ((w->order == LMAP_ORDER_B ? flush_member_b(w) : flush_chunk(w)) != 0) goto done;
 
@@ -552,18 +611,54 @@ int lmap_writer_close(lmap_writer *w) {
         if (write_all(w->fp, hdr, sizeof hdr) != 0) goto done;
     }
 
+    /* --- meta: u32 n, then n x (u32 klen, key, u32 vlen, value), sorted by key --- */
+    {
+        uint32_t *ord = malloc((w->n_meta ? w->n_meta : 1) * sizeof *ord);
+        if (!ord) goto done;
+        for (uint32_t i = 0; i < w->n_meta; i++) ord[i] = i;
+        for (uint32_t i = 1; i < w->n_meta; i++)          /* insertion sort: a few keys */
+            for (uint32_t j = i; j > 0 && strcmp(w->meta[ord[j-1]].k, w->meta[ord[j]].k) > 0; j--) {
+                uint32_t t = ord[j]; ord[j] = ord[j-1]; ord[j-1] = t;
+            }
+        int bad = vec_put32(&meta, w->n_meta);
+        for (uint32_t i = 0; !bad && i < w->n_meta; i++) {
+            const struct kv *kv = &w->meta[ord[i]];
+            size_t kl = strlen(kv->k), vl = strlen(kv->v);
+            if (vl > UINT32_MAX) { bad = 1; break; }
+            bad = vec_put32(&meta, (uint32_t)kl) || vec_put(&meta, kv->k, kl) ||
+                  vec_put32(&meta, (uint32_t)vl) || vec_put(&meta, kv->v, vl);
+        }
+        free(ord);
+        if (bad) goto done;
+    }
+    /* --- grp.a / grp.b: u32 n_groups, u32 name_off[n+1], names, u32 group[n_members] --- */
+    for (int ax = 0; ax < 2; ax++) {
+        if (!w->n_grp[ax]) continue;
+        uint32_t off = 0;
+        int bad = vec_put32(&grp[ax], w->n_grp[ax]);
+        for (uint32_t g = 0; !bad && g <= w->n_grp[ax]; g++) {
+            bad = vec_put32(&grp[ax], off);
+            if (g < w->n_grp[ax]) off += (uint32_t)strlen(w->grp[ax][g]);
+        }
+        for (uint32_t g = 0; !bad && g < w->n_grp[ax]; g++)
+            bad = vec_put(&grp[ax], w->grp[ax][g], strlen(w->grp[ax][g]));
+        for (uint32_t i = 0; !bad && i < w->n_mem[ax]; i++) bad = vec_put32(&grp[ax], w->mem[ax][i].group);
+        if (bad) goto done;
+    }
+
     /* --- sections --- */
     typedef struct { const char *id; const uint8_t *p; size_t n; } secdesc;
-    const secdesc builtin[] = {
-        { "schema",    (const uint8_t *)w->schema, strlen(w->schema) },
-        { "mem.a",     ma.p,      ma.n      },
-        { "mem.b",     mb.p,      mb.n      },
-        { "runs",      w->runs.p, w->runs.n },
-        { "dir.a",     dira.p,    dira.n    },
-        { "dir.a.max", dirax.p,   dirax.n   },
-        { "dir.b",     dirb.p,    dirb.n    },
-    };
-    const uint32_t NB = (uint32_t)(sizeof builtin / sizeof builtin[0]);
+    secdesc builtin[10];
+    uint32_t NB = 0;
+    builtin[NB++] = (secdesc){ "meta",      meta.p,    meta.n    };
+    builtin[NB++] = (secdesc){ "mem.a",     ma.p,      ma.n      };
+    builtin[NB++] = (secdesc){ "mem.b",     mb.p,      mb.n      };
+    if (w->n_grp[0]) builtin[NB++] = (secdesc){ "grp.a", grp[0].p, grp[0].n };
+    if (w->n_grp[1]) builtin[NB++] = (secdesc){ "grp.b", grp[1].p, grp[1].n };
+    builtin[NB++] = (secdesc){ "runs",      w->runs.p, w->runs.n };
+    builtin[NB++] = (secdesc){ "dir.a",     dira.p,    dira.n    };
+    builtin[NB++] = (secdesc){ "dir.a.max", dirax.p,   dirax.n   };
+    builtin[NB++] = (secdesc){ "dir.b",     dirb.p,    dirb.n    };
     const uint32_t NSEC = NB + w->n_xs;
     secdesc  *sec = malloc(NSEC * sizeof *sec);
     uint64_t *off = malloc(NSEC * sizeof *off), *len = malloc(NSEC * sizeof *len);
@@ -621,15 +716,17 @@ int lmap_writer_close(lmap_writer *w) {
     rc = 0;
 done:
     vec_free(&foot); vec_free(&dira); vec_free(&dirax); vec_free(&dirb); vec_free(&ma); vec_free(&mb);
+    vec_free(&meta); vec_free(&grp[0]); vec_free(&grp[1]);
     if (w->fp) { if (fclose(w->fp) != 0) rc = -1; w->fp = NULL; }
-    if (rc != 0 && w->path) remove(w->path);   /* no half-written file left behind */
+    if (rc == 0 && rename(w->tmp, w->path) != 0) rc = -1;
+    if (rc != 0) remove(w->tmp);                /* no half-written file left behind */
     lmap_writer_abort(w);
     return rc;
 }
 
 void lmap_writer_abort(lmap_writer *w) {
     if (!w) return;
-    if (w->fp) fclose(w->fp);
+    if (w->fp) { fclose(w->fp); if (w->tmp) remove(w->tmp); }
     for (int ax = 0; ax < 2; ax++) {
         for (uint32_t i = 0; i < w->n_mem[ax]; i++) free(w->mem[ax][i].name);
         free(w->mem[ax]);
@@ -638,7 +735,13 @@ void lmap_writer_abort(lmap_writer *w) {
     for (uint32_t i = 0; i < w->n_xs; i++) { free(w->xs[i].id); free(w->xs[i].p); }
     free(w->xs);
     vec_free(&w->runs);
-    free(w->path); free(w->profile); free(w->schema);
+    for (uint32_t i = 0; i < w->n_meta; i++) { free(w->meta[i].k); free(w->meta[i].v); }
+    free(w->meta);
+    for (int ax = 0; ax < 2; ax++) {
+        for (uint32_t i = 0; i < w->n_grp[ax]; i++) free(w->grp[ax][i]);
+        free(w->grp[ax]);
+    }
+    free(w->path); free(w->tmp); free(w->profile);
     free(w);
 }
 
@@ -647,8 +750,16 @@ void lmap_writer_abort(lmap_writer *w) {
 struct lmap_file {
     lmap_io *io; int own_io;
     char profile[32];
-    char *schema;
     int order, a_overlap;
+    struct mkv { char *k, *v; } *meta; uint32_t n_meta;       /* sorted by key */
+    struct fgrp {
+        uint32_t n;
+        char **name;
+        uint32_t *by_name;       /* group ids sorted by name */
+        uint32_t *of_member;     /* group per member, LMAP_NO_GROUP if none */
+        uint32_t *first, *list;  /* members of g: list[first[g] .. first[g+1]), name order */
+        uint64_t *length;        /* summed member lengths */
+    } grp[2];
     lmap_chunk *chunks; uint32_t n_chunks;
     uint32_t *dirb_id; uint64_t *dirb_max;
     uint64_t *dira_max;
@@ -663,6 +774,91 @@ static int read_section_body(lmap_io *io, uint64_t off, uint64_t len, uint8_t **
     if (!p) return -1;
     if (lmap_pread(io, p, (int64_t)off, (int64_t)len) != 0) { free(p); return -1; }
     *out = p; return 0;
+}
+
+static int parse_meta(lmap_file *f, const uint8_t *p, size_t n) {
+    if (n < 4) return -1;
+    uint32_t cnt = ld32(p);
+    if ((uint64_t)cnt * 8 > n - 4) return -1;           /* each entry is at least 8 bytes */
+    f->meta = calloc(cnt ? cnt : 1, sizeof *f->meta);
+    if (!f->meta) return -1;
+    f->n_meta = cnt;
+    size_t o = 4;
+    for (uint32_t i = 0; i < cnt; i++) {
+        for (int kv = 0; kv < 2; kv++) {
+            if (n - o < 4) return -1;
+            uint32_t l = ld32(p + o); o += 4;
+            if (l > n - o || memchr(p + o, 0, l)) return -1;
+            char *str = malloc((size_t)l + 1);
+            if (!str) return -1;
+            memcpy(str, p + o, l); str[l] = 0; o += l;
+            if (kv == 0) f->meta[i].k = str; else f->meta[i].v = str;
+        }
+        if (!f->meta[i].k[0] || strlen(f->meta[i].k) > 255) return -1;
+        if (i && strcmp(f->meta[i-1].k, f->meta[i].k) >= 0) return -1;   /* sorted, unique */
+    }
+    return o == n ? 0 : -1;
+}
+
+static int cmp_str_ptr(const void *x, const void *y) {
+    return strcmp(*(char *const *)x, *(char *const *)y);
+}
+
+/* grp.a / grp.b, after the member directory of that axis has been parsed. */
+static int parse_groups(lmap_file *f, int axis, const uint8_t *p, size_t n) {
+    struct fgrp *g = &f->grp[axis];
+    if (n < 4) return -1;
+    uint32_t ng = ld32(p), nm = f->n_mem[axis];
+    uint64_t need = 4ull + ((uint64_t)ng + 1) * 4;
+    if (ng == 0 || need > n) return -1;
+    uint32_t blob = ld32(p + 4 + (size_t)ng * 4);
+    need += (uint64_t)blob + (uint64_t)nm * 4;
+    if (need != n) return -1;
+    const uint8_t *offs = p + 4, *names = offs + ((size_t)ng + 1) * 4, *memg = names + blob;
+    g->name = calloc(ng, sizeof *g->name);
+    g->by_name = malloc(ng * sizeof *g->by_name);
+    g->of_member = malloc((nm ? nm : 1) * sizeof *g->of_member);
+    g->first = calloc((size_t)ng + 1, sizeof *g->first);
+    g->list = malloc((nm ? nm : 1) * sizeof *g->list);
+    g->length = calloc(ng, sizeof *g->length);
+    if (!g->name || !g->by_name || !g->of_member || !g->first || !g->list || !g->length) return -1;
+    g->n = ng;
+    for (uint32_t i = 0; i < ng; i++) {
+        uint32_t a = ld32(offs + (size_t)i * 4), b = ld32(offs + (size_t)(i + 1) * 4);
+        if (a > b || b > blob || a == b || memchr(names + a, 0, b - a)) return -1;
+        if (!(g->name[i] = malloc((size_t)(b - a) + 1))) return -1;
+        memcpy(g->name[i], names + a, b - a); g->name[i][b - a] = 0;
+    }
+    for (uint32_t m = 0; m < nm; m++) {
+        uint32_t gi = ld32(memg + (size_t)m * 4);
+        if (gi != LMAP_NO_GROUP && gi >= ng) return -1;
+        g->of_member[m] = gi;
+        if (gi != LMAP_NO_GROUP) { g->first[gi + 1]++; g->length[gi] += f->mem[axis][m].length; }
+    }
+    for (uint32_t i = 0; i < ng; i++) g->first[i + 1] += g->first[i];
+    uint32_t *fill = calloc(ng, sizeof *fill);
+    if (!fill) return -1;
+    for (uint32_t r = 0; r < nm; r++) {                  /* members in name order */
+        uint32_t m = f->by_name[axis][r], gi = g->of_member[m];
+        if (gi == LMAP_NO_GROUP) continue;
+        if (g->first[gi] + fill[gi] >= g->first[gi + 1]) { free(fill); return -1; }
+        g->list[g->first[gi] + fill[gi]++] = m;
+    }
+    free(fill);
+    /* names unique: sort pointers, compare neighbours, then map back to ids */
+    char **sorted = malloc(ng * sizeof *sorted);
+    if (!sorted) return -1;
+    memcpy(sorted, g->name, ng * sizeof *sorted);
+    qsort(sorted, ng, sizeof *sorted, cmp_str_ptr);
+    int dup = 0;
+    for (uint32_t i = 1; i < ng; i++) if (!strcmp(sorted[i-1], sorted[i])) dup = 1;
+    for (uint32_t i = 0; i < ng && !dup; i++) {
+        uint32_t lo = 0, hi = ng;                       /* position of name i in sorted */
+        while (lo < hi) { uint32_t mid = (lo + hi) / 2; if (strcmp(sorted[mid], g->name[i]) < 0) lo = mid + 1; else hi = mid; }
+        g->by_name[lo] = i;
+    }
+    free(sorted);
+    return dup ? -1 : 0;
 }
 
 static int parse_memdir(lmap_file *f, int axis, const uint8_t *p, size_t n) {
@@ -691,13 +887,21 @@ static int parse_memdir(lmap_file *f, int axis, const uint8_t *p, size_t n) {
         m->first_chunk = ld32(e + 32);
         m->n_chunks    = ld32(e + 36);
     }
+    /* by_name must be a permutation in strictly increasing name order: every name
+     * lookup binary-searches it, names are unique, and groups are filled from it. */
     const uint8_t *perm = names + blob;
-    for (uint32_t i = 0; i < cnt; i++) {
+    uint8_t *seen = calloc(cnt ? cnt : 1, 1);
+    if (!seen) return -1;
+    int bad = 0;
+    for (uint32_t i = 0; i < cnt && !bad; i++) {
         uint32_t id = ld32(perm + (size_t)i * 4);
-        if (id >= cnt) return -1;
+        if (id >= cnt || seen[id]) { bad = 1; break; }
+        seen[id] = 1;
         f->by_name[axis][i] = id;
+        if (i && strcmp(f->mem[axis][f->by_name[axis][i-1]].name, f->mem[axis][id].name) >= 0) bad = 1;
     }
-    return 0;
+    free(seen);
+    return bad ? -1 : 0;
 }
 
 lmap_file *lmap_open_io(lmap_io *io, int own_io) {
@@ -738,7 +942,8 @@ lmap_file *lmap_open_io(lmap_io *io, int own_io) {
      * Reject an inflated count before allocating anything for it. */
     if ((uint64_t)nsec * 31ull > flen) goto footfail;
     uint8_t *dira = NULL, *dirax = NULL, *dirb = NULL, *ma = NULL, *mb = NULL;
-    uint64_t dira_n = 0, dirax_n = 0, dirb_n = 0, ma_n = 0, mb_n = 0;
+    uint8_t *meta = NULL, *ga = NULL, *gb = NULL;
+    uint64_t dira_n = 0, dirax_n = 0, dirb_n = 0, ma_n = 0, mb_n = 0, meta_n = 0, ga_n = 0, gb_n = 0;
     int seen_runs = 0;
     for (uint32_t i = 0; i < nsec; i++) {
         if (end - p < 1) goto footfail;
@@ -759,6 +964,9 @@ lmap_file *lmap_open_io(lmap_io *io, int own_io) {
         else if (!strcmp(id, "dir.b")) { dst = &dirb; dstn = &dirb_n; }
         else if (!strcmp(id, "mem.a")) { dst = &ma;   dstn = &ma_n;   }
         else if (!strcmp(id, "mem.b")) { dst = &mb;   dstn = &mb_n;   }
+        else if (!strcmp(id, "meta"))  { dst = &meta; dstn = &meta_n; }
+        else if (!strcmp(id, "grp.a")) { dst = &ga;   dstn = &ga_n;   }
+        else if (!strcmp(id, "grp.b")) { dst = &gb;   dstn = &gb_n;   }
         else if (!strcmp(id, "runs")) {
             if (seen_runs) goto footfail;         /* duplicate ids are not legal */
             seen_runs = 1;
@@ -768,16 +976,7 @@ lmap_file *lmap_open_io(lmap_io *io, int own_io) {
             f->runs_off = so; f->runs_len = sl; f->runs_crc = scrc;
             continue;
         }
-        else if (!strcmp(id, "schema")) {
-            if (f->schema) goto footfail;
-            uint8_t *sb = NULL;
-            if (read_section_body(io, so, sl, &sb) != 0) goto footfail;
-            if (crc_all(sb, sl) != scrc) { free(sb); goto footfail; }
-            f->schema = malloc((size_t)sl + 1);
-            if (!f->schema) { free(sb); goto footfail; }
-            memcpy(f->schema, sb, (size_t)sl); f->schema[sl] = 0; free(sb);
-            continue;
-        } else if (!strncmp(id, "x.", 2)) {       /* application section: remember, load on demand */
+        else if (!strncmp(id, "x.", 2)) {       /* application section: remember, load on demand */
             for (uint32_t k = 0; k < f->n_xs; k++) if (!strcmp(f->xs[k].id, id)) goto footfail;
             struct xent *nx = realloc(f->xs, (f->n_xs + 1) * sizeof *nx);
             if (!nx) goto footfail;
@@ -846,6 +1045,9 @@ lmap_file *lmap_open_io(lmap_io *io, int own_io) {
     }
     if (ma && parse_memdir(f, 0, ma, (size_t)ma_n) != 0) goto tablefail;
     if (mb && parse_memdir(f, 1, mb, (size_t)mb_n) != 0) goto tablefail;
+    if (!meta || parse_meta(f, meta, (size_t)meta_n) != 0) goto tablefail;
+    if (ga && parse_groups(f, 0, ga, (size_t)ga_n) != 0) goto tablefail;
+    if (gb && parse_groups(f, 1, gb, (size_t)gb_n) != 0) goto tablefail;
     /* Every member id we hand to a caller must actually name a member. */
     for (uint32_t i = 0; i < f->n_chunks; i++) {
         if (f->chunks[i].a_member >= f->n_mem[0] ||
@@ -910,13 +1112,13 @@ lmap_file *lmap_open_io(lmap_io *io, int own_io) {
             }
         }
     }
-    free(dira); free(dirax); free(dirb); free(ma); free(mb);
+    free(dira); free(dirax); free(dirb); free(ma); free(mb); free(meta); free(ga); free(gb);
     return f;
 
 footfail:
     free(foot);
 tablefail:
-    free(dira); free(dirax); free(dirb); free(ma); free(mb);
+    free(dira); free(dirax); free(dirb); free(ma); free(mb); free(meta); free(ga); free(gb);
 fail:
     lmap_close(f);      /* honours own_io, so a failed lmap_open_io(io,1) frees io */
     return NULL;
@@ -934,7 +1136,14 @@ void lmap_close(lmap_file *f) {
         for (uint32_t i = 0; i < f->n_mem[ax]; i++) free(f->mem[ax][i].name);
         free(f->mem[ax]); free(f->by_name[ax]);
     }
-    free(f->chunks); free(f->dirb_id); free(f->dirb_max); free(f->dira_max); free(f->schema);
+    free(f->chunks); free(f->dirb_id); free(f->dirb_max); free(f->dira_max);
+    for (uint32_t i = 0; i < f->n_meta; i++) { free(f->meta[i].k); free(f->meta[i].v); }
+    free(f->meta);
+    for (int ax = 0; ax < 2; ax++) {
+        struct fgrp *g = &f->grp[ax];
+        if (g->name) for (uint32_t i = 0; i < g->n; i++) free(g->name[i]);
+        free(g->name); free(g->by_name); free(g->of_member); free(g->first); free(g->list); free(g->length);
+    }
     for (uint32_t i = 0; i < f->n_xs; i++) free(f->xs[i].id);
     free(f->xs);
     if (f->own_io) lmap_io_close(f->io);
@@ -942,7 +1151,58 @@ void lmap_close(lmap_file *f) {
 }
 
 const char *lmap_profile(const lmap_file *f)     { return f ? f->profile : NULL; }
-const char *lmap_schema_text(const lmap_file *f) { return f ? f->schema : NULL; }
+const char *lmap_meta_get(const lmap_file *f, const char *key) {
+    if (!f || !key) return NULL;
+    uint32_t lo = 0, hi = f->n_meta;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        int c = strcmp(f->meta[mid].k, key);
+        if (c == 0) return f->meta[mid].v;
+        if (c < 0) lo = mid + 1; else hi = mid;
+    }
+    return NULL;
+}
+uint32_t lmap_meta_count(const lmap_file *f) { return f ? f->n_meta : 0; }
+int lmap_meta_at(const lmap_file *f, uint32_t i, const char **key, const char **value) {
+    if (!f || i >= f->n_meta) return -1;
+    if (key) *key = f->meta[i].k;
+    if (value) *value = f->meta[i].v;
+    return 0;
+}
+
+uint32_t lmap_n_groups(const lmap_file *f, int axis) {
+    return (f && (axis == 0 || axis == 1)) ? f->grp[axis].n : 0;
+}
+const char *lmap_group_name(const lmap_file *f, int axis, uint32_t g) {
+    return (g < lmap_n_groups(f, axis)) ? f->grp[axis].name[g] : NULL;
+}
+int32_t lmap_group_by_name(const lmap_file *f, int axis, const char *name) {
+    uint32_t n = lmap_n_groups(f, axis);
+    if (!n || !name) return -1;
+    const struct fgrp *g = &f->grp[axis];
+    uint32_t lo = 0, hi = n;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        int c = strcmp(g->name[g->by_name[mid]], name);
+        if (c == 0) return (int32_t)g->by_name[mid];
+        if (c < 0) lo = mid + 1; else hi = mid;
+    }
+    return -1;
+}
+int32_t lmap_member_group(const lmap_file *f, int axis, uint32_t m) {
+    if (!lmap_n_groups(f, axis) || m >= f->n_mem[axis]) return -1;
+    uint32_t g = f->grp[axis].of_member[m];
+    return g == LMAP_NO_GROUP ? -1 : (int32_t)g;
+}
+int lmap_group_members(const lmap_file *f, int axis, uint32_t g,
+                       const uint32_t **members, uint32_t *n, uint64_t *total_length) {
+    if (g >= lmap_n_groups(f, axis)) return -1;
+    const struct fgrp *G = &f->grp[axis];
+    if (members) *members = G->list + G->first[g];
+    if (n) *n = G->first[g + 1] - G->first[g];
+    if (total_length) *total_length = G->length[g];
+    return 0;
+}
 int         lmap_order(const lmap_file *f)       { return f ? f->order : -1; }
 int         lmap_a_overlap(const lmap_file *f)   { return f ? f->a_overlap : 0; }
 uint32_t    lmap_n_chunks(const lmap_file *f)    { return f ? f->n_chunks : 0; }

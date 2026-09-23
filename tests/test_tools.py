@@ -193,6 +193,27 @@ def main():
     check('from-chain (independently encoded) gives the same runs', dump(L3) == want)
     check('verify passes', run('verify', L1).stdout.strip() == 'OK')
     check('order a, no overlap', 'order\ta' in run('info', L1).stdout)
+    info = run('info', L1).stdout
+    check('axis names are recorded', 'meta.axis.a\tquery' in info and 'meta.axis.b\ttarget' in info)
+    G = os.path.join(wd, 'g.lmap')
+    run('from-paf', paf, G, '--group-sep', '.')
+    ginfo = [l.split('\t') for l in run('info', G).stdout.splitlines() if l.startswith('group.')]
+    want_g = sorted([('group.a', 'gA', f'{len(qseqs)} sequences', f'{sum(qseqs.values())} bp'),
+                     ('group.b', 'gB', f'{len(tseqs)} sequences', f'{sum(tseqs.values())} bp')])
+    check('--group-sep groups each axis by genome, with totals', sorted(map(tuple, ginfo)) == want_g)
+    check('grouping does not change the runs', dump(G) == want)
+    pn = os.path.join(wd, 'pansn.paf')
+    with open(pn, 'w') as f:
+        for q in ('HG002#1#chr1', 'HG002#2#chr1', 'HG003#1#chr2', 'nosep'):
+            f.write(f'{q}\t100\t0\t10\t+\tGCA_000001635.9.chr1\t100\t0\t10\t10\t10\t60\tcg:Z:10M\n')
+    P1, P2 = os.path.join(wd, 'pn1.lmap'), os.path.join(wd, 'pn2.lmap')
+    run('from-paf', pn, P1, '--group-sep', '#', '--group-fields', 2, '--allow-overlap')
+    gp = sorted(l.split('\t')[1] for l in run('info', P1).stdout.splitlines() if l.startswith('group.a'))
+    check("PanSN '#' 2: HG002#1, HG002#2, HG003#1; a name without separators joins none",
+          gp == ['HG002#1', 'HG002#2', 'HG003#1'])
+    run('from-paf', pn, P2, '--group-sep', '.', '--group-fields', 2, '--swap', '--allow-overlap')
+    gp = [l.split('\t')[1] for l in run('info', P2).stdout.splitlines() if l.startswith('group.a')]
+    check("dotted accession '.' 2: GCA_000001635.9", gp == ['GCA_000001635.9'])
     for gap in (0, 7, 10000):
         for fmt in ('paf', 'chain'):
             x = os.path.join(wd, f'rt.{gap}.{fmt}'); y = x + '.lmap'

@@ -4,8 +4,9 @@ A **liftmap** is a set of colinear ungapped *runs* relating intervals on axis **
 intervals on axis **b**, chunked, indexed from both axes, in one self-describing file.
 
 Two profiles are defined here: `hal2.edge` (a child genome onto its parent) and `taffy.tui`
-(a genome onto a universal column axis). They differ only in the schema text — the container,
-codec, chunking and index machinery are identical.
+(a genome onto a universal column axis). They differ only in run order, chunk constants,
+metadata and application sections — the container, codec, chunking and index machinery are
+identical.
 
 Design rules this draft is required to honour:
 
@@ -15,42 +16,25 @@ Design rules this draft is required to honour:
   Backends: local fd, `udc2` (HTTP range), container slice, memory.
 - **Open is two `pread`s** — the trailer, then the footer. No temp files, no eager per-type
   index arrays, no scan.
-- **The schema describes every byte, payload included.** A reader that understands this
-  document plus the embedded schema text can decode every run without knowing what the axes
-  mean. (This is the thing ONEcode stops short of: its `D R 2 3 INT 6 STRING` declares "an int
-  and a blob", which is ~1% of a `.tui`.)
+- **This document describes every byte, payload included.** A reader that implements it can
+  decode every run without knowing what the axes mean. (This is the thing ONEcode stops short
+  of: its `D R 2 3 INT 6 STRING` declares "an int and a blob", which is ~1% of a `.tui`.)
 
 **History.** liftmap began as `libintervalmap` (prefix `imap_`, magic `IMAP`); its format 4
 is liftmap's format 1, renamed. Measurements below that mention `.lmap` files were taken
-under the old name.
+under the old name. Format 2 replaced a free-text "schema" section with metadata (2.5) and
+added groups (2.4a).
 
 ---
 
-## 1. Schema text
+## 1. Runs
 
-Plain ASCII, stored verbatim in the footer, one directive per line, `#` to end of line is a
-comment. It is the normative description of the file: **if the schema and the writer disagree,
-the writer is wrong.**
-
-### 1.1 Directives
-
-```
-liftmap <major>                          format version of this document
-profile <name> <version>              who wrote it and what the axes mean
-
-axis <a|b> <label> coord <seqlocal|global> [extent <n>]
-                                      seqlocal: coordinates are (member, offset)
-                                      global:   one integer axis, `extent` = its cardinality
-
-field <name> delta <none|prev_end> enc <uvarint|zigzag|bitmap> [min <n>]
-                                      one declaration per stream, in stream order
-
-order <a|b>                           run order within a chunk
-chunk count <n> [bspan <n>] [seqbound <a|b|both|none>]
-block <none|zstd|zlib>
-
-section <id> <kind> [args...]         one per section present
-```
+The run model and its codec are fixed by this document and the format major version. An
+earlier draft embedded a schema text (`axis`, `field`, `order`, `chunk` directives) meant to
+make them configurable per file; nothing ever read it, so format 2 dropped it. What varies
+per file is recorded where it is used: run order and the axis-a overlap bit in the header
+(2), chunk constants implicitly in the chunk directory, and what the axes mean in metadata
+(2.5).
 
 ### 1.2 Field semantics (normative)
 
@@ -221,7 +205,7 @@ Little-endian throughout. Sections are 8-byte aligned.
 ```
 HEADER  (64 B, at offset 0 — sized so format sniffers that read 64 bytes see all of it)
   0   u8[8]   magic  = "LMAP\x1A\x0D\x0A\x00"
-  8   u32     lmap_major         1; a reader requires an exact match
+  8   u32     lmap_major         2; a reader requires an exact match
   12  u32     lmap_minor         0
   16  u64     feature_flags      unknown bit set => reader MUST refuse
                                  bit 0: runs within a chunk are in order b
@@ -232,8 +216,7 @@ HEADER  (64 B, at offset 0 — sized so format sniffers that read 64 bytes see a
 
 ...sections...
 
-FOOTER  (variable): section table, member directories, chunk directories,
-                    schema text, provenance, summary stats
+FOOTER  (variable): the section table
 
 TRAILER (32 B, last 32 bytes of the file)
   0   u64     footer_off         relative to byte 0
@@ -405,27 +388,69 @@ That whole structure — and HAL's `getSequenceBySite`, which `DnaIterator::getS
 per base per column and which degrades to an allocating binary search above 1000 sequences
 (`hdf5Genome.cpp:37`, `:360-378`) — simply does not exist here.
 
-### 2.5 Optional sections
+### 2.4a Groups `grp.a` / `grp.b` (optional)
+
+A group is a named set of members of one axis — typically one genome's sequences, where one
+axis carries several genomes (`.tui`, multi-genome PAFs). A member is in at most one group.
+
+```
+  u32 n_groups                          >= 1; the section is absent when there are none
+  u32 name_off[n_groups + 1]            name i is blob[name_off[i] .. name_off[i+1])
+  name blob                             names unique, non-empty
+  u32 group[n_members]                  group id per member, 0xFFFFFFFF = none
+```
+
+Group ids are declaration order, which is how a writer records an order it cares about
+(`.tui` keeps its genome order). A reader derives each group's members in name order and
+their summed length at open, so a genome's sequences, its size and its sequence count cost
+nothing to ask for, and the member ids go straight to a cursor filter (2.6). Groups replace
+the `"<genome>."` name-prefix convention, which cannot be parsed in general: `hg38.chr1`
+splits at the first `.`, `GCA_000001635.9.chr1` at the second, PanSN `HG002#1#chr1` at the
+second `#`. The writer records the answer instead.
+
+Member names are unique per axis, and `mem.*`'s `by_name` must list every member once in
+strictly increasing name order; a reader refuses anything else. (A fuzzer found that an
+unchecked `by_name` with a repeated id overran the group lists built from it.)
+
+### 2.5 Metadata and optional sections
+
+**Metadata** (`meta`, required, loaded at open): string key → string value.
+
+```
+  u32 n
+  n x { u32 key_len, key, u32 value_len, value }     sorted by key, keys unique
+```
+
+Keys are 1–255 bytes, and neither keys nor values contain NUL; anything else is allowed,
+tabs and newlines included. Standard keys — a library-level vocabulary so tools can describe
+any liftmap without knowing its profile:
+
+| key | meaning |
+|---|---|
+| `axis.a`, `axis.b` | what each axis is: `child`/`parent`, `query`/`target`, `sequence`/`universal column` |
+| `max_gap` | runs were merged across gaps of up to this many bp; coordinates are approximate. Absent or `0` = exact |
+| `tree` | Newick tree over the groups' names |
+| `source`, `program`, `description` | provenance |
+
+Applications prefix their own keys (`tui.format`, `tui.anchors`).
+
 
 **Application sections.** Any section whose id begins `x.` belongs to the application: the
 library stores it verbatim, checksums it like every other section, and never interprets it.
 It is loaded only when asked for, so a large one costs nothing at open. Ids are unique; a
-reader refuses a duplicate. This is where profile-specific data lives rather than in the
-library: the `taffy.tui` profile keeps its column count, `max_gap`, source Newick, genome
-roster, and the column → MAF file-offset anchors used by `view -U` as `x.tui.*` sections.
+reader refuses a duplicate. This is for bulk profile data that does not belong in metadata:
+`.tui` keeps its column → MAF file-offset anchors, used by `view -U`, as `x.tui.anchor`.
 
 Sections the library itself may define later, not yet implemented:
 
 | id | kind | for |
 |---|---|---|
-| `group` | `(cluster_id, member, start, len)` records | hal2 paralogy as equivalence classes |
+| `paralogy` | `(cluster_id, member, start, len)` records | hal2 paralogy as equivalence classes |
 | `stats` | counts, coverage, run-length and gap histograms | O(1) `halStats` |
-| `prov` | program, version, command, date — one record per writer | provenance |
 
-Member names can be looked up by prefix: the members whose name begins with a given string
-form one contiguous range in name order. `.tui` uses this to find all sequences of a genome
-(`"<genome>."`), which is why the prefix must include the separator — `"g1."` must not
-match `g10.chr1`.
+Member names can also be looked up by prefix (the members whose name begins with a string
+form one contiguous range in name order), but a group is the reliable way to name a
+genome's sequences (2.4a).
 
 ---
 
@@ -471,30 +496,12 @@ the order of paralogous matches at a column, which was unspecified and layout-de
 
 ### 3.1 `hal2.edge` — a child genome onto its parent
 
-```
-liftmap 1
-profile hal2.edge 1
-
-axis  a  child   coord seqlocal
-axis  b  parent  coord seqlocal
-
-field a       delta prev_end   enc uvarint
-field b       delta prev_exit  enc zigzag
-field len     delta none       enc uvarint  min 1
-field strand  delta none       enc bitmap
-
-order   a
-chunk   count 8192  bspan 1000000  seqbound both
-block   zstd
-
-section mem.a  memdir  axis a
-section mem.b  memdir  axis b
-section runs   runs
-section dir.a  chunkdir   order a
-section dir.b  chunkperm  dir.a  order b  prefixmax b_end
-section stats  stats
-section prov   prov
-```
+| | |
+|---|---|
+| axes | a = child sequences, b = parent sequences (`axis.a` = `child`, `axis.b` = `parent`) |
+| order | a |
+| chunks | count 8192, bspan 10^6 |
+| groups | none needed: one genome per axis |
 
 Axis a is strictly sorted and disjoint (a child base has 0 or 1 parent), so `a` is `uvarint`.
 Axis b may repeat and reorder — that is paralogy and rearrangement — so `b` is `zigzag`.
@@ -505,44 +512,20 @@ duplicated positions, zero differences.
 
 ### 3.2 `taffy.tui` — a genome onto the universal column axis
 
-```
-liftmap 1
-profile taffy.tui 3
+| | |
+|---|---|
+| axes | a = `genome.sequence` of every genome, b = one member `column` of length T |
+| order | b |
+| chunks | count 65536, bspan 10^6 (`TUI_CHUNK_RUNS`, `TUI_CHUNK_G_MAX`) |
+| groups | axis a, one per resolved genome, in genome order |
+| metadata | `tui.format`, `tree` (the `# hal` Newick), `max_gap`, `tui.anchors`, `axis.*`, provenance |
+| sections | `x.tui.anchor`: the column → MAF file-offset index |
 
-axis  a  genome  coord seqlocal
-axis  b  column  coord global  extent 72489835721
+A chained index (`max_gap > 0`) sets `A_OVERLAP`; a base index does not. T is the column
+member's length rather than a separate field.
 
-field a       delta prev_end   enc zigzag
-field b       delta prev_end   enc zigzag
-field len     delta none       enc uvarint  min 1
-field strand  delta none       enc bitmap
-
-order   b
-chunk   count 65536  bspan 1000000  seqbound a
-block   zstd
-
-section mem.a   memdir  axis a
-section runs    runs
-section dir.a   chunkdir   order a
-section dir.b   chunkperm  dir.a  order b  prefixmax b_end
-section anchor  anchor  key b  value fileoff  every 10000
-section meta    meta
-section prov    prov
-```
-
-No `mem.b` — axis b is `global`, so it has one implicit member of size `extent`. `order b`
-and `count 65536` preserve today's `.tui` behaviour; `seqbound a` only, since axis b has no
-members to bound against. The `# hal` Newick and `max_gap` live in `meta`.
-
-As implemented in taffy (tui format 0.4) the column axis is an explicit `mem.b` with one
-member, `column`, of length T, and the tui-specific data is application sections (2.5):
-`x.tui.meta` (`key\tvalue` lines: format, T, max_gap, anchor count, provenance),
-`x.tui.tree` (the Newick), `x.tui.roster` (genome, total bp, sequence count) and
-`x.tui.anchor` (the column → file-offset index). A chained index (`max_gap > 0`) sets
-`A_OVERLAP`; a base index does not.
-
-That is the whole difference between the two formats: **axis declarations, run order, chunk
-constants, and which optional sections are present.**
+That is the whole difference between the two profiles: **run order, chunk constants,
+metadata, groups, and which application sections are present.**
 
 ---
 

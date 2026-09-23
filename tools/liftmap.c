@@ -1,7 +1,7 @@
 /* liftmap -- command-line converters and lookups for liftmap files.
  *
- *   liftmap from-paf   in.paf[.gz]   out.lmap   [--swap] [--allow-overlap]
- *   liftmap from-chain in.chain[.gz] out.lmap   [--swap] [--allow-overlap]
+ *   liftmap from-paf   in.paf[.gz]   out.lmap   [--swap] [--allow-overlap] [--group-sep C [--group-fields N]]
+ *   liftmap from-chain in.chain[.gz] out.lmap   [--swap] [--allow-overlap] [--group-sep C [--group-fields N]]
  *   liftmap to-paf     in.lmap [out.paf]        [--max-gap N]
  *   liftmap to-chain   in.lmap [out.chain]      [--max-gap N]
  *   liftmap lift       in.lmap in.bed [out.bed] [--from a|b]
@@ -107,7 +107,7 @@ static uint32_t seqtab_id(seqtab *t, const char *name, int64_t length, const rea
     while (t->slot[h]) {
         seqinfo *s = &t->seq[t->slot[h] - 1];
         if (!strcmp(s->name, name)) {
-            if (s->length != length)
+            if (s->length != length && r)
                 die("%s:%" PRId64 ": %s has length %" PRId64 " here but %" PRId64 " earlier",
                     r->path, r->lineno, name, length, s->length);
             return t->slot[h] - 1;
@@ -316,8 +316,40 @@ static void canonicalize(importer *im) {
     qsort(im->r, im->n, sizeof *im->r, cmp_run);
 }
 
+/* Group each axis's sequences by the name up to the n-th `sep`: "hg38.chr1" -> "hg38"
+ * ('.', 1), "GCA_000001635.9.chr1" -> "GCA_000001635.9" ('.', 2), "HG002#1#chr1" ->
+ * "HG002#1" ('#', 2).  A name with fewer separators, or nothing after them, joins no
+ * group.  No single rule fits every naming scheme, so the caller says which applies. */
+static const char *nth_sep(const char *name, char sep, int n) {
+    const char *p = name;
+    for (int k = 0; k < n; k++) {
+        p = strchr(k ? p + 1 : p, sep);
+        if (!p) return NULL;
+    }
+    return (p == name || !p[1]) ? NULL : p;
+}
+
+static void add_groups(lmap_writer *w, importer *im, char sep, int fields) {
+    for (int ax = 0; ax < 2; ax++) {
+        seqtab g = {0};
+        for (uint32_t i = 0; i < im->ax[ax].n; i++) {
+            const char *name = im->ax[ax].seq[i].name, *cut = nth_sep(name, sep, fields);
+            if (!cut) continue;
+            char *prefix = xmalloc((size_t)(cut - name) + 1);
+            memcpy(prefix, name, (size_t)(cut - name)); prefix[cut - name] = 0;
+            uint32_t n0 = g.n;
+            uint32_t gid = seqtab_id(&g, prefix, 0, NULL);
+            if (g.n > n0 && lmap_writer_add_group(w, ax, prefix) != (int32_t)gid) die("cannot add group %s", prefix);
+            if (lmap_writer_set_member_group(w, ax, i, gid)) die("cannot group %s", name);
+            free(prefix);
+        }
+        for (uint32_t i = 0; i < g.n; i++) free(g.seq[i].name);
+        free(g.seq); free(g.slot);
+    }
+}
+
 static void write_import(importer *im, const char *out, const char *profile,
-                         const char *source, int allow_overlap) {
+                         const char *source, int allow_overlap, char group_sep, int group_fields) {
     canonicalize(im);
     int64_t overlaps = 0; size_t first_ov = 0;
     for (size_t i = 1; i < im->n; i++)
@@ -331,7 +363,7 @@ static void write_import(importer *im, const char *out, const char *profile,
             im->ax[0].seq[x->am].name, x->a);
     }
 
-    lmap_writer *w = lmap_writer_open(out, profile, NULL);
+    lmap_writer *w = lmap_writer_open(out, profile);
     if (!w) die("cannot write %s: %s", out, strerror(errno));
     if (overlaps && (lmap_writer_set_order(w, LMAP_ORDER_B) || lmap_writer_set_a_overlap(w)))
         die("cannot set order b / overlap on %s", out);
@@ -339,17 +371,18 @@ static void write_import(importer *im, const char *out, const char *profile,
         for (uint32_t i = 0; i < im->ax[ax].n; i++)
             if (lmap_writer_add_member(w, ax, im->ax[ax].seq[i].name, (uint64_t)im->ax[ax].seq[i].length) != (int32_t)i)
                 die("cannot add sequence %s", im->ax[ax].seq[i].name);
+    if (group_sep) add_groups(w, im, group_sep, group_fields);
     for (size_t i = 0; i < im->n; i++) {
         run *x = &im->r[i];
         if (lmap_writer_add_run(w, x->am, x->bm, x->a, x->b, x->len, x->strand))
             die("writer refused run %s:%" PRId64 " -> %s:%" PRId64 " len %" PRId64,
                 im->ax[0].seq[x->am].name, x->a, im->ax[1].seq[x->bm].name, x->b, x->len);
     }
-    char meta[1024];
-    snprintf(meta, sizeof meta, "source\t%s\naxis_a\t%s\naxis_b\t%s\n", source,
-             !strcmp(profile, "paf") ? (im->swap ? "target" : "query") : (im->swap ? "q" : "t"),
-             !strcmp(profile, "paf") ? (im->swap ? "query" : "target") : (im->swap ? "t" : "q"));
-    if (lmap_writer_add_section(w, "x.liftmap.meta", meta, strlen(meta)) || lmap_writer_close(w))
+    int paf = !strcmp(profile, "paf");
+    if (lmap_writer_set_meta(w, "source", source) ||
+        lmap_writer_set_meta(w, "axis.a", paf ? (im->swap ? "target" : "query") : (im->swap ? "q" : "t")) ||
+        lmap_writer_set_meta(w, "axis.b", paf ? (im->swap ? "query" : "target") : (im->swap ? "t" : "q")) ||
+        lmap_writer_close(w))
         die("failed writing %s", out);
     fprintf(stderr, "liftmap: %zu runs, %u + %u sequences%s -> %s\n", im->n, im->ax[0].n, im->ax[1].n,
             overlaps ? " (axis a overlaps: order b)" : "", out);
@@ -498,6 +531,7 @@ static void usage(void) {
         "usage:\n"
         "  liftmap from-paf   in.paf[.gz]   out.lmap   [--swap] [--allow-overlap]\n"
         "  liftmap from-chain in.chain[.gz] out.lmap   [--swap] [--allow-overlap]\n"
+        "                     [--group-sep C [--group-fields N]]\n"
         "  liftmap to-paf     in.lmap [out.paf]        [--max-gap N]\n"
         "  liftmap to-chain   in.lmap [out.chain]      [--max-gap N]\n"
         "  liftmap lift       in.lmap in.bed [out.bed] [--from a|b]\n"
@@ -508,7 +542,10 @@ static void usage(void) {
         "Axis a is the sequence named first in each record: the PAF query, the chain\n"
         "target.  a -> b is each format's lift direction; --swap exchanges them on import.\n"
         "Import keeps aligned base pairs and strands only; export regroups runs into\n"
-        "records joined across gaps of at most --max-gap bp (default 10000).\n");
+        "records joined across gaps of at most --max-gap bp (default 10000).\n"
+        "--group-sep C groups sequences into genomes by the name up to the N-th C\n"
+        "(--group-fields, default 1): '.' 1 for hg38.chr1, '.' 2 for GCA_000001635.9.chr1,\n"
+        "'#' 2 for PanSN HG002#1#chr1.\n");
     exit(2);
 }
 
@@ -523,10 +560,21 @@ int main(int argc, char **argv) {
     const char *cmd = argv[1];
     const char *pos[3] = {0}; int npos = 0;
     int swap = 0, allow_overlap = 0, from_b = 0;
+    char group_sep = 0;
+    int group_fields = 1;
     int64_t max_gap = 10000;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--swap")) swap = 1;
         else if (!strcmp(argv[i], "--allow-overlap")) allow_overlap = 1;
+        else if (!strcmp(argv[i], "--group-sep") && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (strlen(v) != 1) usage();
+            group_sep = v[0];
+        }
+        else if (!strcmp(argv[i], "--group-fields") && i + 1 < argc) {
+            group_fields = atoi(argv[++i]);
+            if (group_fields < 1) usage();
+        }
         else if (!strcmp(argv[i], "--max-gap") && i + 1 < argc) max_gap = strtoll(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--from") && i + 1 < argc) {
             const char *v = argv[++i];
@@ -543,7 +591,7 @@ int main(int argc, char **argv) {
         importer im; memset(&im, 0, sizeof im); im.swap = swap;
         int paf = !strcmp(cmd, "from-paf");
         if (paf) import_paf(&im, pos[0]); else import_chain(&im, pos[0]);
-        write_import(&im, pos[1], paf ? "paf" : "chain", pos[0], allow_overlap);
+        write_import(&im, pos[1], paf ? "paf" : "chain", pos[0], allow_overlap, group_sep, group_fields);
         return 0;
     }
     if (!strcmp(cmd, "to-paf") || !strcmp(cmd, "to-chain")) {
@@ -589,8 +637,17 @@ int main(int argc, char **argv) {
                lmap_profile(f), lmap_order(f) == LMAP_ORDER_B ? 'b' : 'a', lmap_a_overlap(f) ? "yes" : "no",
                lmap_n_members(f, 0), lmap_n_members(f, 1), lmap_n_chunks(f), runs, bytes,
                runs ? (double)bytes / (double)runs : 0.0);
-        uint8_t *meta; size_t n;
-        if (lmap_read_section(f, "x.liftmap.meta", &meta, &n) == 0) { fwrite(meta, 1, n, stdout); free(meta); }
+        for (uint32_t i = 0; i < lmap_meta_count(f); i++) {
+            const char *k, *v;
+            lmap_meta_at(f, i, &k, &v);
+            printf("meta.%s\t%s\n", k, v);
+        }
+        for (int ax = 0; ax < 2; ax++)
+            for (uint32_t g = 0; g < lmap_n_groups(f, ax); g++) {
+                uint32_t nm; uint64_t len;
+                lmap_group_members(f, ax, g, NULL, &nm, &len);
+                printf("group.%c\t%s\t%u sequences\t%" PRIu64 " bp\n", ax ? 'b' : 'a', lmap_group_name(f, ax, g), nm, len);
+            }
         lmap_close(f);
         return 0;
     }

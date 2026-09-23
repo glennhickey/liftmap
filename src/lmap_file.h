@@ -35,9 +35,9 @@
 #define LMAP_CODEC_DEFLATE  1     /* raw deflate per stream, verbatim where it would not shrink */
 
 /* On-disk format version.  There is no reader for earlier drafts: a file written
- * before a bump must be regenerated.  Major 1 is libintervalmap's format 4 under the
- * liftmap name and magic. */
-#define LMAP_FORMAT_MAJOR 1
+ * before a bump must be regenerated.  Major 1 was libintervalmap's format 4 renamed;
+ * major 2 replaced the free-text schema section with metadata and added groups. */
+#define LMAP_FORMAT_MAJOR 2
 
 /* One chunk's directory entry, in memory (native types; serialized explicitly). */
 typedef struct {
@@ -66,8 +66,23 @@ typedef struct {
 
 typedef struct lmap_writer lmap_writer;
 
-/* `profile` is e.g. "hal2.edge"; `schema` is the schema text, stored verbatim. */
-lmap_writer *lmap_writer_open(const char *path, const char *profile, const char *schema);
+#define LMAP_NO_GROUP 0xFFFFFFFFu
+
+/* `profile` names what the file is, e.g. "hal2.edge" (at most 31 bytes kept).  The
+ * file is written as `path`.partial and renamed to `path` only by a successful close;
+ * a failed close or an abort removes it. */
+lmap_writer *lmap_writer_open(const char *path, const char *profile);
+
+/* Metadata (SPEC 2.5): key -> value strings, loaded at open.  Setting a key again
+ * replaces it.  Keys are 1..255 bytes; see the SPEC for the standard keys (axis names,
+ * max_gap, tree).  Applications prefix their own keys, e.g. "tui.format". */
+int lmap_writer_set_meta(lmap_writer *w, const char *key, const char *value);
+
+/* Groups (SPEC 2.4a): a named set of members of one axis, e.g. one genome's sequences.
+ * add_group returns the group id (declaration order; names unique per axis);
+ * set_member_group puts a member in it.  A member is in at most one group. */
+int32_t lmap_writer_add_group(lmap_writer *w, int axis, const char *name);
+int     lmap_writer_set_member_group(lmap_writer *w, int axis, uint32_t member, uint32_t group);
 
 /* Members must be declared before any run referencing them. Returns member id. */
 int32_t lmap_writer_add_member(lmap_writer *w, int axis, const char *name, uint64_t length);
@@ -107,7 +122,20 @@ lmap_file *lmap_open_io(lmap_io *io, int own_io);
 void       lmap_close(lmap_file *f);
 
 const char *lmap_profile(const lmap_file *f);
-const char *lmap_schema_text(const lmap_file *f);
+const char *lmap_meta_get(const lmap_file *f, const char *key);    /* NULL if absent */
+uint32_t    lmap_meta_count(const lmap_file *f);                    /* in key order */
+int         lmap_meta_at(const lmap_file *f, uint32_t i, const char **key, const char **value);
+
+/* Groups of one axis: ids 0..n-1 in declaration order.  lmap_group_members gives the
+ * group's member ids in name order (borrowed, valid until close), their count and
+ * summed length -- pass the ids straight to lmap_cursor_open to restrict a cursor to
+ * the group.  lmap_member_group is -1 for a member in no group. */
+uint32_t    lmap_n_groups(const lmap_file *f, int axis);
+const char *lmap_group_name(const lmap_file *f, int axis, uint32_t g);
+int32_t     lmap_group_by_name(const lmap_file *f, int axis, const char *name);
+int32_t     lmap_member_group(const lmap_file *f, int axis, uint32_t m);
+int         lmap_group_members(const lmap_file *f, int axis, uint32_t g,
+                               const uint32_t **members, uint32_t *n, uint64_t *total_length);
 int         lmap_order(const lmap_file *f);          /* LMAP_ORDER_A or LMAP_ORDER_B */
 int         lmap_a_overlap(const lmap_file *f);      /* 1 if axis a may overlap */
 uint32_t    lmap_n_chunks(const lmap_file *f);

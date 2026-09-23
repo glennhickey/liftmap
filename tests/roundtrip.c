@@ -22,7 +22,7 @@ int main(int argc, char **argv) {
     int32_t namem=0, nbmem=0;
     for (long i=0;i<n;i++){ if(r[i].am+1>namem) namem=r[i].am+1; if(r[i].bm+1>nbmem) nbmem=r[i].bm+1; }
 
-    lmap_writer *w = lmap_writer_open(argv[2], "hal2.edge", "liftmap 1\nprofile hal2.edge 1\n");
+    lmap_writer *w = lmap_writer_open(argv[2], "hal2.edge");
     if (!w) { fprintf(stderr,"writer open failed\n"); return 1; }
     if (lmap_writer_set_params(w,(uint32_t)atoi(argv[3]),1000000,LMAP_CODEC_DEFLATE)!=0) return 1;
     char nm[64];

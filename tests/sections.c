@@ -10,7 +10,7 @@ static int fails = 0;
 
 int main(int argc, char **argv) {
     const char *path = argc > 1 ? argv[1] : "/tmp/lmap_sections_test.lmap";
-    lmap_writer *w = lmap_writer_open(path, "test", "liftmap 1\n");
+    lmap_writer *w = lmap_writer_open(path, "test");
     const char *names[] = { "g2.x", "g1.chr2", "g10.chrA", "g1.chr1", "h.y" };
     for (int i = 0; i < 5; i++) lmap_writer_add_member(w, 0, names[i], 1000);
     lmap_writer_add_member(w, 1, "column", 100000);
@@ -72,7 +72,7 @@ int main(int argc, char **argv) {
 
     /* writer contract: runs must lie inside both members and not overlap on axis a */
     printf("run contract:\n");
-    w = lmap_writer_open(path, "test", "liftmap 1\n");
+    w = lmap_writer_open(path, "test");
     lmap_writer_add_member(w, 0, "s", 100);
     lmap_writer_add_member(w, 1, "column", 1000);
     CHECK("refuses a run past the axis-a member end", lmap_writer_add_run(w, 0, 0, 95, 0, 10, 0) != 0);
@@ -83,7 +83,7 @@ int main(int argc, char **argv) {
 
     /* A_OVERLAP: axis a may overlap, order b only */
     printf("axis-a overlap:\n");
-    w = lmap_writer_open(path, "test", "liftmap 1\n");
+    w = lmap_writer_open(path, "test");
     CHECK("refused under order a",  lmap_writer_set_a_overlap(w) != 0);
     lmap_writer_set_order(w, LMAP_ORDER_B);
     CHECK("accepted under order b", lmap_writer_set_a_overlap(w) == 0);
@@ -107,6 +107,66 @@ int main(int argc, char **argv) {
           hh[0].b == 107 && hh[1].b == 507);   /* tie on a: by b */
     free(hh);
     if (f) lmap_close(f);
+
+    printf("names:\n");
+    remove(path);
+    w = lmap_writer_open(path, "test");
+    lmap_writer_add_member(w, 0, "dup", 10); lmap_writer_add_member(w, 0, "dup", 10);
+    lmap_writer_add_member(w, 1, "column", 100);
+    CHECK("refuses duplicate member names at close", lmap_writer_close(w) != 0);
+    { FILE *t = fopen(path, "rb"); char pp[4096]; snprintf(pp, sizeof pp, "%s.partial", path);
+      FILE *q = fopen(pp, "rb");
+      CHECK("a failed close leaves neither the file nor a partial", !t && !q);
+      if (t) fclose(t);
+      if (q) fclose(q); }
+
+    /* metadata and groups */
+    printf("metadata and groups:\n");
+    w = lmap_writer_open(path, "test");
+    CHECK("sets a key",                     lmap_writer_set_meta(w, "tui.format", "0.4") == 0);
+    CHECK("replaces a key",                 lmap_writer_set_meta(w, "tui.format", "0.5") == 0);
+    CHECK("keeps tabs and newlines in values", lmap_writer_set_meta(w, "axis.a", "seq\tuence\nx") == 0);
+    CHECK("refuses an empty key",           lmap_writer_set_meta(w, "", "v") != 0);
+    lmap_writer_set_meta(w, "axis.b", "column");
+    const char *seqs[] = { "gB.chr2", "gA.chr1", "gB.chr1", "loose", "gA.chr10" };
+    const uint64_t lens[] = { 200, 100, 300, 50, 400 };
+    for (int i = 0; i < 5; i++) lmap_writer_add_member(w, 0, seqs[i], lens[i]);
+    lmap_writer_add_member(w, 1, "column", 100000);
+    int32_t gB = lmap_writer_add_group(w, 0, "gB"), gA = lmap_writer_add_group(w, 0, "gA");
+    CHECK("groups get ids in declaration order", gB == 0 && gA == 1);
+    CHECK("refuses a duplicate group name", lmap_writer_add_group(w, 0, "gA") < 0);
+    CHECK("refuses a member id out of range", lmap_writer_set_member_group(w, 0, 9, 0) != 0);
+    CHECK("refuses a group id out of range",  lmap_writer_set_member_group(w, 0, 0, 7) != 0);
+    lmap_writer_set_member_group(w, 0, 0, (uint32_t)gB); lmap_writer_set_member_group(w, 0, 2, (uint32_t)gB);
+    lmap_writer_set_member_group(w, 0, 1, (uint32_t)gA); lmap_writer_set_member_group(w, 0, 4, (uint32_t)gA);
+    for (int i = 0; i < 5; i++) lmap_writer_add_run(w, (uint32_t)i, 0, 0, 1000 * i, 10, 0);
+    CHECK("closes", lmap_writer_close(w) == 0);
+    f = lmap_open(path);
+    CHECK("reopens", f != NULL);
+    if (!f) return 1;
+    CHECK("reads a key back (latest value)", lmap_meta_get(f, "tui.format") && !strcmp(lmap_meta_get(f, "tui.format"), "0.5"));
+    CHECK("value keeps tab and newline", lmap_meta_get(f, "axis.a") && !strcmp(lmap_meta_get(f, "axis.a"), "seq\tuence\nx"));
+    CHECK("absent key is NULL", lmap_meta_get(f, "nope") == NULL);
+    const char *k0, *k2;
+    CHECK("enumerates 3 keys in key order", lmap_meta_count(f) == 3 && lmap_meta_at(f, 0, &k0, NULL) == 0 &&
+          lmap_meta_at(f, 2, &k2, NULL) == 0 && !strcmp(k0, "axis.a") && !strcmp(k2, "tui.format"));
+    CHECK("2 groups on axis a, none on b", lmap_n_groups(f, 0) == 2 && lmap_n_groups(f, 1) == 0);
+    CHECK("group names and lookup", !strcmp(lmap_group_name(f, 0, 0), "gB") && lmap_group_by_name(f, 0, "gA") == 1 &&
+          lmap_group_by_name(f, 0, "gC") == -1);
+    const uint32_t *mm; uint32_t nmm; uint64_t tl;
+    CHECK("members in name order, with total length",
+          lmap_group_members(f, 0, 1, &mm, &nmm, &tl) == 0 && nmm == 2 && tl == 500 &&
+          !strcmp(lmap_member_at(f, 0, mm[0])->name, "gA.chr1") && !strcmp(lmap_member_at(f, 0, mm[1])->name, "gA.chr10"));
+    CHECK("member -> group, and -1 for none",
+          lmap_member_group(f, 0, (uint32_t)lmap_member_by_name(f, 0, "gB.chr1")) == 0 &&
+          lmap_member_group(f, 0, (uint32_t)lmap_member_by_name(f, 0, "loose")) == -1);
+    lmap_cursor *gc = lmap_cursor_open(f, 1, 0, mm, nmm, 0);
+    lmap_hit gh; int ngh = 0; int only_a = 1;
+    lmap_cursor_seek(gc, 0, 100000);
+    while (lmap_cursor_next(gc, &gh) == 1) { ngh++; if (lmap_member_group(f, 0, gh.a_member) != 1) only_a = 0; }
+    CHECK("a cursor restricted to a group sees only its members", ngh == 2 && only_a);
+    lmap_cursor_close(gc);
+    lmap_close(f);
 
     printf("%s (%d failures)\n", fails ? "FAILURES" : "ALL PASS", fails);
     return fails ? 1 : 0;
