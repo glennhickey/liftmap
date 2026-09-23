@@ -637,15 +637,21 @@ checked against the ONEcode build of taffy on the same inputs:
 
 | | rodent | fish subtree |
 |---|---|---|
-| `.tui` size, ONEcode → liftmap | 235.5 → 227.8 MB | 1,956 → 1,916 MB |
-| `taffy index -u` wall | 2:46 → 2:40 | 37:50 → 38:11 |
-| open | 7 ms | 72 ms (354,369 chunks, 120,805 sequences) |
-| `view -U`, 30 regions × 3 modes | 90/90 identical, 5.0 → 5.3 s | 90/90 identical, 35.3 → 40.3 s |
-| `lift`, 300 BED intervals × 4 modes | 5 genomes, 20/20 identical | 4 genomes, 16/16 identical |
+| `.tui` size, ONEcode → liftmap | 235.5 → 227.9 MB | 1,956 → 1,917 MB |
+| `taffy index -u` wall | 2:46 → 2:46 | 37:50 → 39:00 |
+| open (format 3: directories paged) | 2.9 ms | 8.4 ms (354,369 chunks, 120,805 sequences) |
+| `view -U`, 30 regions × 3 modes | 90/90 identical, 5.5 → 5.4 s | 90/90 identical, 35.3 → 35.7 s |
+| `lift`, 300 BED intervals × 4 modes | 5 genomes, 19/20 identical* | 4 genomes, 16/16 identical |
+| `lift -F --chainOverlapFrac 0` | 1.3–1.6 → 0.7–1.3 s | 1.4–2.9 → 0.9–1.5 s |
 
-The fish `view` gap is the open: every directory is parsed at open, ~0.07 s here, which
-repeats per invocation. At 577-way scale that grows to about a second, so loading the chunk
-directories lazily is the next reader change.
+\* The one difference: where paralogous matches meet at a column, taffy's default lift
+splits rows by the order matches arrive, which the ONEcode reader left to the chunk layout
+and the cursor fixes; coverage is identical.
+
+Before format 3 every chunk directory was read at open: 72 ms on fish, repeated per
+invocation, which made `view` 14% slower there. Paging the directories removed it; what
+remains at open is mostly the member directory (120,805 sequence names on fish), which is
+also where the next gain at 577-way scale would come from.
 
 Still open, to be measured rather than argued:
 
