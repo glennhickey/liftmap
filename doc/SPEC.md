@@ -13,7 +13,8 @@ Design rules this draft is required to honour:
 - **Every stored offset is relative to the file's own byte 0.** No `SEEK_END`, no absolute
   paths. This is what lets a file be embedded in a zip/tar/pack later without a format change.
 - **All I/O through `pread(handle, buf, off, len)`** where `handle = {backend, base, len}`.
-  Backends: local fd, `udc2` (HTTP range), container slice, memory.
+  Backends: local fd, HTTP(S) range (liftmap's libcurl backend, §5), container slice,
+  memory, or any backend an application supplies.
 - **Open is two `pread`s** — the trailer, then the footer. No temp files, no eager per-type
   index arrays, no scan.
 - **This document describes every byte, payload included.** A reader that implements it can
@@ -683,7 +684,7 @@ count.
 
 - `lmap_io_open_backend(be, ctx, size)` turns any `read(ctx, buf, off, len)` into a
   handle. That is how a client plugs in the remote stack it already has: taffy uses
-  htslib's hFILE, and HAL2 will use udc2. liftmap does not depend on any of them.
+  htslib's hFILE for the schemes only it speaks. liftmap depends on none of them.
 - `lmap_io_cache(inner, block, capacity, readahead, own)` goes in front of any handle.
   - Blocks are 64 KiB, with 64 MiB of them held least-recently-used.
   - Adjacent misses are coalesced into one request.
@@ -752,7 +753,7 @@ through a custom backend and through the cache, and requires identical hits.
 | R1 | `lmap_io_open_backend` seam; `lmap_io_cache` block cache with coalescing, read-ahead and stats | **done** |
 | R2 | optional libcurl backend, `lmap_open` on URLs, `bin/liftmap` over http(s) | **done** |
 | R3 | taffy: remote `.tui` for `view -U` and `lift`; libcurl for http(s), hFILE for other schemes | **done**, identical output to local on rodent |
-| R4 | HAL2: node files and `.2bit` through udc2 (a backend over `udcRead`, which keeps its own persistent disk cache, so no `lmap_io_cache` is needed in front); the manifest resolves relative locators against its own URL (as `LodManager::resolvePath` does); blockViz reads a remote HAL2 | planned |
+| R4 | HAL format 3: `.hgn` genome files, and `.2bit` DNA through twobit64, both over liftmap's libcurl backend and `lmap_io_cache`, not udc. That keeps UCSC kent code out of the dependency tree, and gives bounded range requests. The manifest resolves relative locators against its own URL (as `LodManager::resolvePath` does); blockViz reads a remote `.hal`. twobit64 already reads URLs this way. | planned |
 | R5 | performance at 577-way and beyond, below | planned |
 
 **R5 items**, in rough order of expected payoff:
@@ -772,9 +773,10 @@ through a custom backend and through the cache, and requires identical hits.
    directories sit just before it. So open could fetch the last N KB speculatively with a
    suffix range (`bytes=-N`), sized from a hint in the header, and return from a single
    request when everything fits.
-4. **Persistent disk cache** for clients that have none (HAL2 gets one from udc):
-   content-addressed by URL, `ETag` or `Last-Modified`, and block index, so a restarted
-   process or a second tool reuses what was fetched.
+4. **Persistent disk cache**, content-addressed by URL, `ETag` or `Last-Modified`, and
+   block index, so a restarted process or a second tool reuses what was fetched. Browser
+   use of HAL format 3 needs this: blockViz under UCSC has relied on udc's disk cache,
+   and this replaces it. So it moves ahead of items 2 and 3 once R4 starts.
 5. **Remote container slices.** A manifest may point into a tarball or zip64 archive at
    an offset (constraint 1). `lmap_io_slice` over a remote handle already covers the
    read side. What remains is resolving a member name to an offset through the
