@@ -664,3 +664,122 @@ Still open, to be measured rather than argued:
    chunks end up small.
 4. **`b` as `uvarint` under `order b`.** If b-ordered chunks make the enter-delta monotone it
    can drop the zigzag bit.
+
+---
+
+## 5. Remote access
+
+A liftmap file is meant to be read where it sits: on a web server, in a bucket, behind a
+browser (UCSC blockViz and track hubs). ONEcode could not do this at all, since it is
+stdio-only, and that was one of the reasons to leave it. Nothing in the format has to
+change for it. Every stored offset is file-relative (constraint 1), all reads go through
+`lmap_pread` (constraint 2), and open touches only the trailer, footer and member
+directories (constraint 3). What remains is transport, and making each round trip
+count.
+
+### 5.1 Design
+
+**The seam and the cache live in liftmap; transports mostly live in the client.**
+
+- `lmap_io_open_backend(be, ctx, size)` turns any `read(ctx, buf, off, len)` into a
+  handle. That is how a client plugs in the remote stack it already has: taffy uses
+  htslib's hFILE, and HAL2 will use udc2. liftmap does not depend on any of them.
+- `lmap_io_cache(inner, block, capacity, readahead, own)` goes in front of any handle.
+  - Blocks are 64 KiB, with 64 MiB of them held least-recently-used.
+  - Adjacent misses are coalesced into one request.
+  - Sequential misses read ahead, doubling up to 4 MiB.
+  - A read bigger than a quarter of the cache bypasses it.
+  - It is thread-safe, and `lmap_io_get_cache_stats` reports requests, bytes, hits and
+    misses.
+  - Directory pages (4 KiB, §2.3a) and chunks (tens of KiB) are both smaller than a block,
+    so one request usually serves several of them.
+- `lmap_io_open_url` is an optional libcurl backend (`make HTTP=1`). Without it, the core
+  still needs only zlib and pthreads. It makes bounded range requests
+  (`Range: bytes=off-end`) on one reused connection, and it gets the size from `HEAD`.
+  `lmap_open` uses it, behind the cache, for any path containing `://`, so `bin/liftmap`
+  reads URLs directly.
+
+**Use bounded ranges.** A transport that asks for an open-ended range (`bytes=off-`) and
+hangs up once it has enough makes the server send far more than is read. The server keeps
+writing into socket buffers until the connection drops, and object stores bill for those
+bytes.
+
+Measured on the rodent universal index over a local range server, with `taffy lift`
+on 20 BED intervals:
+
+| transport | requests | open-ended | bytes sent by the server | output |
+|---|---|---|---|---|
+| htslib hFILE (open-ended ranges) | 71 | 69 | ~150 MB | identical |
+| liftmap libcurl (bounded ranges) | 85 | 0 | **8.8 MB** | identical |
+
+Wall time was the same on loopback. On a real network, the extra ~140 MB is the whole
+difference. taffy therefore uses liftmap's backend for `http://` and `https://`, and
+hFILE only for the schemes it alone speaks (`s3://`, `gs://`, ...).
+
+hFILE also has a correctness bug, found here. In htslib 1.17, a forward seek of less than
+1 MB is served by reading and discarding data (`hfile_libcurl.c`, `libcurl_read`). When a
+network read ends exactly where the skip ends, `to_skip` is never reset, so the next read
+skips the same amount again and returns bytes from the wrong offset, with no error.
+liftmap's per-chunk CRCs caught it (§2.2): the error surfaced as "corrupt run data"
+rather than as wrong lift output. taffy's hFILE backend works around the bug by doing
+short forward skips itself. This is a second reason to validate payload checksums on
+every remote read.
+
+**Measured costs** (loopback range server, default cache):
+
+| | requests | bytes |
+|---|---|---|
+| open, rodent (11,698 sequences) | 5 | 1.2 MB |
+| open, fish subtree (120,805 sequences) | 6 | 11.7 MB |
+| `taffy lift`, 20 intervals, rodent | 70–85 | 7.9–8.8 MB |
+| `taffy view -U`, 2 kb region, rodent | 15 | ~11 MB, mostly the `.maf.gz` blocks, not the `.tui` |
+
+In `tests/remote.c` on rodent, 500 random queries plus cursor sweeps took 1,039
+uncached reads and 613 through the cache. With 20 ms of latency per read, that is 7.4 s
+against 4.0 s. A repeated workload makes 0 new reads. The cache trades bytes for round trips. It fetches whole
+64 KiB blocks, so that workload moved 39.7 MB against 13.5 MB uncached. On any network
+where latency dominates, that is the right trade, and `block_bytes` is the knob.
+
+Correctness is checked in two places. `tests/test_tools.py` serves files from an
+in-process HTTP server with Range support and requires `dump`, `info` and `lift` over
+`http://` to match the local results. `tests/remote.c` runs the same workload directly,
+through a custom backend and through the cache, and requires identical hits.
+
+### 5.2 Roadmap
+
+| phase | what | status |
+|---|---|---|
+| R1 | `lmap_io_open_backend` seam; `lmap_io_cache` block cache with coalescing, read-ahead and stats | **done** |
+| R2 | optional libcurl backend, `lmap_open` on URLs, `bin/liftmap` over http(s) | **done** |
+| R3 | taffy: remote `.tui` for `view -U` and `lift`; libcurl for http(s), hFILE for other schemes | **done**, identical output to local on rodent |
+| R4 | HAL2: node files and `.2bit` through udc2 (a backend over `udcRead`, which keeps its own persistent disk cache, so no `lmap_io_cache` is needed in front); the manifest resolves relative locators against its own URL (as `LodManager::resolvePath` does); blockViz reads a remote HAL2 | planned |
+| R5 | performance at 577-way and beyond, below | planned |
+
+**R5 items**, in rough order of expected payoff:
+
+1. **Page the member directory.** It is most of the open cost: 11.7 MB for 120,805 fish
+   sequences, and it grows with sequence count, not with what a query touches. Page
+   `mem.a`/`mem.b` the way the chunk directories already are (§2.3a), with a small top
+   level holding the first name of each page. Open then costs a fixed few KB, and a
+   lookup by name costs one page. This needs a format minor bump, and a reader keeps
+   accepting the unpaged layout.
+2. **Parallel fetches.** Today the cache issues one request at a time. The next step is
+   the curl multi interface, with HTTP/2 where the server offers it, so that a lift over
+   many intervals, or a `view` needing several chunks, overlaps its round trips. The
+   cursor already knows which chunks it will need next (the heap merge of overlapping
+   chunks), so it can prefetch them.
+3. **Open in one round trip.** The trailer is 32 B at the end, and the footer and member
+   directories sit just before it. So open could fetch the last N KB speculatively with a
+   suffix range (`bytes=-N`), sized from a hint in the header, and return from a single
+   request when everything fits.
+4. **Persistent disk cache** for clients that have none (HAL2 gets one from udc):
+   content-addressed by URL, `ETag` or `Last-Modified`, and block index, so a restarted
+   process or a second tool reuses what was fetched.
+5. **Remote container slices.** A manifest may point into a tarball or zip64 archive at
+   an offset (constraint 1). `lmap_io_slice` over a remote handle already covers the
+   read side. What remains is resolving a member name to an offset through the
+   container's index, and fetching that index once.
+6. **Validation against real object stores** (S3, GCS, a CDN) over real latency.
+   Loopback numbers bound request counts, not wall time.
+
+The format commits to none of these. R5.1 is the only item that touches the file layout.

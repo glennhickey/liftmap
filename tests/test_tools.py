@@ -271,6 +271,59 @@ def best_check(lmap, seqs, side, rnd, n=3000):
     check(f'--best 0 on windows keeps a subset of the pieces ({len(ws)} of {len(wa)})', set(ws) <= set(wa) and len(ws) < len(wa))
     os.unlink(bed)
 
+def http_check(wd, files, qseqs, tseqs, rnd):
+    """Serve wd over HTTP with Range support (standard library only) and require that dump,
+    lift and info through http:// URLs equal the local file's.  Skipped when bin/liftmap
+    was built without HTTP (make HTTP=1)."""
+    import http.server, threading
+    counts = {'requests': 0}
+    class H(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **k): super().__init__(*a, directory=wd, **k)
+        def log_message(self, *a): pass
+        def do_GET(self):
+            rng = self.headers.get('Range')
+            path = self.translate_path(self.path)
+            if not rng or not os.path.isfile(path):
+                return super().do_GET()
+            size = os.path.getsize(path)
+            lo, hi = rng.split('=')[1].split('-')
+            lo = int(lo); hi = min(int(hi) if hi else size - 1, size - 1)
+            counts['requests'] += 1
+            with open(path, 'rb') as f:
+                f.seek(lo); body = f.read(hi - lo + 1)
+            self.send_response(206)
+            self.send_header('Content-Range', f'bytes {lo}-{hi}/{size}')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Accept-Ranges', 'bytes')
+            self.end_headers()
+            self.wfile.write(body)
+    srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), H)
+    t = threading.Thread(target=srv.serve_forever, daemon=True); t.start()
+    base = f'http://127.0.0.1:{srv.server_address[1]}/'
+    try:
+        probe = run('info', base + os.path.basename(files[0]), ok=False)
+        if probe.returncode != 0:
+            print('  skip (bin/liftmap built without HTTP; make HTTP=1)')
+            return
+        for fn in files:
+            url = base + os.path.basename(fn)
+            check(f'dump over HTTP equals the local file ({os.path.basename(fn)})', dump(url) == dump(fn))
+            check(f'info over HTTP equals the local file ({os.path.basename(fn)})',
+                  run('info', url).stdout == run('info', fn).stdout)
+            with tempfile.NamedTemporaryFile('w', suffix='.bed', delete=False) as f:
+                for i in range(200):
+                    s = rnd.choice(list(qseqs)); p = rnd.randrange(qseqs[s]); f.write(f'{s}\t{p}\t{p+300}\tr{i}\t0\t+\n')
+                bed = f.name
+            before = counts['requests']
+            a = run('lift', url, bed, '--max-gap', 20).stdout
+            n_req = counts['requests'] - before
+            check(f'lift over HTTP equals local ({n_req} range requests for 200 intervals)',
+                  a == run('lift', fn, bed, '--max-gap', 20).stdout)
+            os.unlink(bed)
+        check('a missing URL is refused', run('info', base + 'nope.lmap', ok=False).returncode != 0)
+    finally:
+        srv.shutdown()
+
 def dump(lmap):
     out = run('dump', lmap).stdout
     return sorted((f[0], int(f[1]), f[2], int(f[3]), int(f[4]), f[5])
@@ -416,6 +469,9 @@ def main():
         f.write('q\t100\t0\t10\t+\tt\t100\t0\t10\t10\t10\t60\tcg:Z:10M\n'
                 'q\t90\t20\t30\t+\tt\t100\t20\t30\t10\t10\t60\tcg:Z:10M\n')
     check('a sequence given two lengths is refused', run('from-paf', bad, O, ok=False).returncode != 0)
+
+    print('over HTTP (range requests):')
+    http_check(wd, [L1, O], qseqs, tseqs, rnd)
 
     robust = os.path.join(BIN, 'robust')
     if os.path.exists(robust):

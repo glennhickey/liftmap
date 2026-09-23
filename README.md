@@ -59,6 +59,15 @@ liftmap began as `libintervalmap`; its history is carried over.
 The public API is `src/liftmap.h`. `src/lmap_file.h` holds the internals (the writer the
 builder drives, the chunk directory, the codec) for the library and its tests.
 
+## Remote files
+
+`lmap_open` reads `http://` and `https://` URLs in a build with `make HTTP=1` (libcurl),
+through a block cache that turns the reader's small reads into a few bounded range
+requests. Opening the rodent universal index remotely takes 5 requests. An application
+with its own remote stack (htslib, UCSC udc, a cloud SDK) plugs it in with
+`lmap_io_open_backend` and puts `lmap_io_cache` in front of it. The design, measurements
+and roadmap are in `doc/SPEC.md` §5.
+
 ## Command line
 
 ```
@@ -107,6 +116,7 @@ with `halLiftover` on 294,220 single-base mappings in both directions, and with 
 ```
 make            # libliftmap.a, bin/liftmap and the test programs
 make check      # self-contained: generated data, brute-force oracle
+make HTTP=1     # also read http(s):// URLs (needs libcurl; `make clean` when switching)
 ```
 
 ## Licence

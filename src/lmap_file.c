@@ -1103,7 +1103,13 @@ fail:
 }
 
 lmap_file *lmap_open(const char *path) {
-    lmap_io *io = lmap_io_open_file(path);
+    lmap_io *io;
+    if (path && strstr(path, "://")) {
+        /* a URL: range requests (HTTP=1 builds), behind the block cache */
+        lmap_io *u = lmap_io_open_url(path);
+        io = u ? lmap_io_cache(u, 0, 0, 0, 1) : NULL;
+        if (u && !io) lmap_io_close(u);
+    } else io = lmap_io_open_file(path);
     if (!io) return NULL;
     return lmap_open_io(io, 1);   /* takes ownership on success and on failure */
 }
